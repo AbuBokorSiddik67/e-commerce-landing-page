@@ -1,0 +1,101 @@
+export const PERMISSIONS = {
+  DASHBOARD_VIEW: "dashboard.view",
+  PRODUCT_VIEW: "products.view",
+  PRODUCT_WRITE: "products.write",
+  PRODUCT_DELETE: "products.delete",
+  CATEGORY_WRITE: "categories.write",
+  PAGE_VIEW: "pages.view",
+  PAGE_WRITE: "pages.write",
+  PAGE_PUBLISH: "pages.publish",
+  TEMPLATE_WRITE: "templates.write",
+  ORDER_VIEW: "orders.view",
+  ORDER_WRITE: "orders.write",
+  ORDER_DELETE: "orders.delete",
+  INVENTORY_VIEW: "inventory.view",
+  INVENTORY_WRITE: "inventory.write",
+  CUSTOMER_VIEW: "customers.view",
+  CUSTOMER_WRITE: "customers.write",
+  COUPON_WRITE: "coupons.write",
+  REVIEW_MODERATE: "reviews.moderate",
+  REFUND_WRITE: "refunds.write",
+  ANALYTICS_VIEW: "analytics.view",
+  MEDIA_WRITE: "media.write",
+  STAFF_VIEW: "staff.view",
+  STAFF_WRITE: "staff.write",
+  SETTINGS_VIEW: "settings.view",
+  SETTINGS_WRITE: "settings.write",
+  PAYMENT_SETTINGS: "payments.settings",
+  COURIER_SETTINGS: "couriers.settings",
+  MARKETING_SETTINGS: "marketing.settings",
+  AUDIT_VIEW: "audit.view",
+  NOTIFICATION_VIEW: "notifications.view",
+} as const;
+
+export type PermissionKey = (typeof PERMISSIONS)[keyof typeof PERMISSIONS];
+
+export const ALL_PERMISSIONS = Object.values(PERMISSIONS) as PermissionKey[];
+
+/**
+ * Default role matrix. The owner role is intentionally absent: it is resolved
+ * as "all permissions" and cannot be edited, preventing accidental lockout.
+ */
+export const ROLE_PERMISSIONS: Record<string, PermissionKey[]> = {
+  ADMINISTRATOR: ALL_PERMISSIONS,
+  MANAGER: [
+    PERMISSIONS.DASHBOARD_VIEW, PERMISSIONS.PRODUCT_VIEW, PERMISSIONS.PRODUCT_WRITE,
+    PERMISSIONS.CATEGORY_WRITE, PERMISSIONS.PAGE_VIEW, PERMISSIONS.PAGE_WRITE,
+    PERMISSIONS.PAGE_PUBLISH, PERMISSIONS.ORDER_VIEW, PERMISSIONS.ORDER_WRITE,
+    PERMISSIONS.INVENTORY_VIEW, PERMISSIONS.INVENTORY_WRITE, PERMISSIONS.CUSTOMER_VIEW,
+    PERMISSIONS.COUPON_WRITE, PERMISSIONS.REVIEW_MODERATE, PERMISSIONS.ANALYTICS_VIEW,
+    PERMISSIONS.MEDIA_WRITE, PERMISSIONS.NOTIFICATION_VIEW, PERMISSIONS.SETTINGS_VIEW,
+  ],
+  PRODUCT_MANAGER: [
+    PERMISSIONS.DASHBOARD_VIEW, PERMISSIONS.PRODUCT_VIEW, PERMISSIONS.PRODUCT_WRITE,
+    PERMISSIONS.CATEGORY_WRITE, PERMISSIONS.PAGE_VIEW, PERMISSIONS.PAGE_WRITE,
+    PERMISSIONS.PAGE_PUBLISH, PERMISSIONS.INVENTORY_VIEW, PERMISSIONS.INVENTORY_WRITE,
+    PERMISSIONS.MEDIA_WRITE, PERMISSIONS.REVIEW_MODERATE,
+  ],
+  ORDER_MANAGER: [
+    PERMISSIONS.DASHBOARD_VIEW, PERMISSIONS.PRODUCT_VIEW, PERMISSIONS.ORDER_VIEW,
+    PERMISSIONS.ORDER_WRITE, PERMISSIONS.INVENTORY_VIEW, PERMISSIONS.INVENTORY_WRITE,
+    PERMISSIONS.CUSTOMER_VIEW, PERMISSIONS.CUSTOMER_WRITE, PERMISSIONS.REFUND_WRITE,
+    PERMISSIONS.ANALYTICS_VIEW, PERMISSIONS.NOTIFICATION_VIEW,
+  ],
+  MARKETING_MANAGER: [
+    PERMISSIONS.DASHBOARD_VIEW, PERMISSIONS.PRODUCT_VIEW, PERMISSIONS.PAGE_VIEW,
+    PERMISSIONS.PAGE_WRITE, PERMISSIONS.PAGE_PUBLISH, PERMISSIONS.TEMPLATE_WRITE,
+    PERMISSIONS.COUPON_WRITE, PERMISSIONS.REVIEW_MODERATE, PERMISSIONS.ANALYTICS_VIEW,
+    PERMISSIONS.MEDIA_WRITE, PERMISSIONS.MARKETING_SETTINGS, PERMISSIONS.NOTIFICATION_VIEW,
+  ],
+  VIEWER: [
+    PERMISSIONS.DASHBOARD_VIEW, PERMISSIONS.PRODUCT_VIEW, PERMISSIONS.PAGE_VIEW,
+    PERMISSIONS.ORDER_VIEW, PERMISSIONS.INVENTORY_VIEW, PERMISSIONS.CUSTOMER_VIEW,
+    PERMISSIONS.ANALYTICS_VIEW, PERMISSIONS.NOTIFICATION_VIEW, PERMISSIONS.SETTINGS_VIEW,
+  ],
+};
+
+export const ROLE_LABELS: Record<string, string> = {
+  OWNER: "Owner",
+  ADMINISTRATOR: "Administrator",
+  MANAGER: "Manager",
+  PRODUCT_MANAGER: "Product Manager",
+  ORDER_MANAGER: "Order Manager",
+  MARKETING_MANAGER: "Marketing Manager",
+  VIEWER: "Viewer",
+};
+
+export function permissionsForRoles(roles: string[]): Set<PermissionKey> {
+  const result = new Set<PermissionKey>();
+  if (roles.includes("OWNER")) {
+    ALL_PERMISSIONS.forEach((p) => result.add(p));
+    return result;
+  }
+  for (const role of roles) {
+    for (const permission of ROLE_PERMISSIONS[role] ?? []) result.add(permission);
+  }
+  return result;
+}
+
+export function hasPermission(roles: string[], permission: PermissionKey) {
+  return permissionsForRoles(roles).has(permission);
+}

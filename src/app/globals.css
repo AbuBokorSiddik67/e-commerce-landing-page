@@ -1,0 +1,41 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-display: Georgia, "Times New Roman", serif;
+  --brand: #206a53;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body { @apply bg-ink-50 text-ink-900 antialiased; }
+::selection { background: #b0dbc9; color: #0a211c; }
+
+@layer components {
+  .container-wide { @apply mx-auto w-full max-w-[1280px] px-5 sm:px-8; }
+  .surface { @apply rounded-2xl border border-ink-100 bg-white shadow-card; }
+  .muted { @apply text-sm text-ink-500; }
+  .label { @apply mb-1.5 block text-xs font-semibold uppercase tracking-wide text-ink-500; }
+  .input { @apply w-full rounded-lg border border-ink-200 bg-white px-3 py-2.5 text-sm text-ink-900 outline-none transition placeholder:text-ink-400 focus:border-brand-500 focus:ring-2 focus:ring-brand-500/20 disabled:bg-ink-50; }
+  .textarea { @apply input min-h-[100px] resize-y; }
+  .btn { @apply inline-flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-semibold transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-600 disabled:cursor-not-allowed disabled:opacity-50; }
+  .btn-primary { @apply btn bg-brand-700 text-white hover:bg-brand-800; }
+  .btn-secondary { @apply btn border border-ink-200 bg-white text-ink-700 hover:bg-ink-50; }
+  .btn-ghost { @apply btn text-ink-600 hover:bg-ink-100; }
+  .btn-danger { @apply btn bg-red-600 text-white hover:bg-red-700; }
+  .badge { @apply inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold; }
+  .table-wrap { @apply overflow-x-auto rounded-2xl border border-ink-100 bg-white; }
+  .table { @apply w-full min-w-[640px] border-collapse text-left text-sm; }
+  .table th { @apply whitespace-nowrap border-b border-ink-100 bg-ink-50/60 px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink-500; }
+  .table td { @apply border-b border-ink-100 px-4 py-3 align-middle last:border-0; }
+  .table tr:hover td { @apply bg-ink-50/40; }
+  .alert-error { @apply rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700; }
+  .alert-success { @apply rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-700; }
+  .section-label { @apply text-xs font-bold uppercase tracking-[0.2em] text-brand-600; }
+  .h-display { @apply font-display text-4xl font-semibold leading-tight tracking-tight sm:text-5xl; }
+}
+
+.prose-body { line-height: 1.8; white-space: pre-wrap; }
+input[type="checkbox"] { accent-color: #206a53; }

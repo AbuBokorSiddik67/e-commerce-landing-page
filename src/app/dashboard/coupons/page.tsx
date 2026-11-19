@@ -1,0 +1,19 @@
+import { prisma } from "@/lib/prisma";
+import { listCoupons } from "@/services/coupons";
+import { formatDate } from "@/lib/utils";
+import { Alert, Badge, Card, PageHeader } from "@/components/ui";
+import { saveCouponAction } from "@/app/actions/catalog";
+
+export default async function CouponsPage({ searchParams }: { searchParams: Promise<{ error?: string; success?: string }> }) {
+  const params = await searchParams;
+  const coupons = await listCoupons();
+  const products = await prisma.product.findMany({ select: { id: true, name: true }, orderBy: { name: "asc" } });
+  return (
+    <>
+      <PageHeader title="Coupons" description="Server-side validation enforces limits, expiry, product scope and first-order rules." />
+      <Alert error={params.error} success={params.success} />
+      <div className="grid gap-6 lg:grid-cols-[1fr_380px]"><div className="table-wrap h-fit"><table className="table"><thead><tr><th>Code</th><th>Discount</th><th>Minimum</th><th>Usage</th><th>Expires</th><th>Status</th></tr></thead><tbody>{coupons.map((coupon) => <tr key={coupon.id}><td className="font-semibold">{coupon.code}<p className="text-xs text-ink-400">{coupon.product?.name ?? "All products"}</p></td><td>{coupon.type === "PERCENTAGE" ? `${coupon.value}%` : `৳${coupon.value}`}{coupon.maxDiscount ? ` (max ৳${coupon.maxDiscount})` : ""}</td><td>৳{coupon.minOrderValue}</td><td>{coupon.usedCount}{coupon.usageLimit ? ` / ${coupon.usageLimit}` : ""}</td><td>{coupon.expiresAt ? formatDate(coupon.expiresAt) : "No expiry"}</td><td><Badge tone={coupon.isActive ? "success" : "neutral"}>{coupon.isActive ? "Active" : "Disabled"}</Badge></td></tr>)}</tbody></table>{!coupons.length && <p className="p-6 text-sm text-ink-500">No coupons configured.</p>}</div>
+        <Card className="p-6"><h2 className="font-semibold">Create coupon</h2><form action={saveCouponAction} className="mt-4 space-y-3"><label className="block"><span className="label">Code</span><input className="input uppercase" name="code" required /></label><div className="grid grid-cols-2 gap-3"><label className="block"><span className="label">Type</span><select className="input" name="type"><option value="PERCENTAGE">Percentage</option><option value="FIXED">Fixed</option></select></label><label className="block"><span className="label">Value</span><input className="input" type="number" min={1} name="value" required /></label></div><label className="block"><span className="label">Product (optional)</span><select className="input" name="productId"><option value="">All products</option>{products.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label><div className="grid grid-cols-2 gap-3"><label className="block"><span className="label">Minimum order</span><input className="input" type="number" min={0} name="minOrderValue" defaultValue={0} /></label><label className="block"><span className="label">Max discount</span><input className="input" type="number" min={1} name="maxDiscount" /></label></div><div className="grid grid-cols-2 gap-3"><label className="block"><span className="label">Usage limit</span><input className="input" type="number" min={1} name="usageLimit" /></label><label className="block"><span className="label">Starts at</span><input className="input" type="datetime-local" name="startsAt" /></label></div><label className="block"><span className="label">Expires at</span><input className="input" type="datetime-local" name="expiresAt" /></label><label className="flex items-center gap-2 text-sm"><input type="checkbox" name="firstOrderOnly" />First order only</label><label className="flex items-center gap-2 text-sm"><input type="checkbox" name="isActive" defaultChecked />Active</label><button className="btn-primary w-full">Save coupon</button></form></Card></div>
+    </>
+  );
+}
