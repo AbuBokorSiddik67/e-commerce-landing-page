@@ -1,0 +1,61 @@
+{
+  "name": "landiq",
+  "version": "1.0.0",
+  "private": true,
+  "description": "LANDIQ — self-hosted e-commerce landing page management software",
+  "scripts": {
+    "dev": "next dev -H 0.0.0.0",
+    "build": "prisma generate && next build",
+    "start": "next start -H 0.0.0.0",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:deploy": "prisma migrate deploy",
+    "prisma:push": "prisma db push",
+    "db:seed": "tsx prisma/seed.ts",
+    "db:setup": "tsx scripts/setup-test-db.ts && prisma db push --skip-generate && tsx prisma/seed.ts"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.658.1",
+    "@prisma/client": "6.19.3",
+    "bcryptjs": "^2.4.3",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.468.0",
+    "next": "15.5.29",
+    "nodemailer": "^6.9.16",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "server-only": "^0.0.1",
+    "tailwind-merge": "^2.5.5",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.49.1",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.1.0",
+    "@testing-library/user-event": "^14.5.2",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^22.10.2",
+    "@types/nodemailer": "^6.4.17",
+    "@types/react": "19.1.8",
+    "@types/react-dom": "19.1.6",
+    "autoprefixer": "^10.4.20",
+    "embedded-postgres": "^17.12.0-beta.19",
+    "eslint": "^8.57.1",
+    "eslint-config-next": "^15.5.29",
+    "jsdom": "^25.0.1",
+    "postcss": "^8.4.49",
+    "prisma": "6.19.3",
+    "tailwindcss": "^3.4.17",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
