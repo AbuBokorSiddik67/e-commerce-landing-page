@@ -17,16 +17,14 @@
     "prisma:deploy": "prisma migrate deploy",
     "prisma:push": "prisma db push",
     "db:seed": "tsx prisma/seed.ts",
-    "db:setup": "tsx scripts/setup-test-db.ts && prisma db push --skip-generate && tsx prisma/seed.ts"
-  },
-  "prisma": {
-    "seed": "tsx prisma/seed.ts"
+    "db:setup": "tsx scripts/dev-db.ts && prisma db push --skip-generate && tsx prisma/seed.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.658.1",
     "@prisma/client": "6.19.3",
     "bcryptjs": "^2.4.3",
     "clsx": "^2.1.1",
+    "dotenv": "^18.0.10",
     "lucide-react": "^0.468.0",
     "next": "15.5.29",
     "nodemailer": "^6.9.16",
@@ -57,5 +55,13 @@
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
+  },
+  "allowScripts": {
+    "@embedded-postgres/linux-x64@17.12.0-beta.19": true,
+    "@prisma/client@6.19.3": true,
+    "@prisma/engines@6.19.3": true,
+    "esbuild@0.28.2": true,
+    "esbuild@0.21.5": true,
+    "prisma@6.19.3": true
   }
 }
