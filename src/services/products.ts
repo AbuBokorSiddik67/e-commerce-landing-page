@@ -1,23 +1,31 @@
 import { z } from "zod";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { audit } from "@/lib/audit";
 import { ConflictError, NotFoundError } from "@/lib/errors";
 import { slugify } from "@/lib/utils";
 import { nonNegativeInt, slugSchema } from "@/lib/validation";
-import { attributeSchema, variantAttributesSchema } from "@/lib/product-attributes";
+import { attributeSchema, normalizeStoredVariantAttributes, variantAttributesSchema } from "@/lib/product-attributes";
+
+const stockSchema = z.number().int().min(0).max(2_147_483_647);
 
 export const variantSchema = z.object({
-  id: z.string().optional(),
+  id: z.string().min(1).optional(),
   name: z.string().trim().min(1).max(120),
   sku: z.string().trim().max(80).optional().nullable(),
   price: nonNegativeInt.optional().nullable(),
-  stock: nonNegativeInt.default(0),
+  stock: stockSchema,
   lowStockThreshold: nonNegativeInt.default(5),
   imageUrl: z.string().max(500).optional().nullable(),
-  attributes: variantAttributesSchema.default([]),
+  // Absence means "leave an existing variant untouched"; [] means "clear".
+  attributes: variantAttributesSchema.optional(),
+  // These are edit preconditions, not attributes to persist.
+  expectedStock: stockSchema.optional(),
+  expectedUpdatedAt: z.string().datetime().optional(),
+  expectedAttributes: z.unknown().optional(),
   isActive: z.boolean().default(true),
   position: z.number().int().min(0).default(0),
-});
+}).strict();
 
 export const productSchema = z.object({
   name: z.string().trim().min(2).max(180),
@@ -27,12 +35,17 @@ export const productSchema = z.object({
   description: z.string().max(20000).optional().nullable(),
   regularPrice: nonNegativeInt,
   salePrice: nonNegativeInt.optional().nullable(),
-  categoryId: z.string().optional().nullable(),
+  categoryId: z.string().min(1).optional().nullable(),
+  expectedCategoryId: z.string().min(1).optional().nullable(),
   status: z.enum(["DRAFT", "PUBLISHED", "ARCHIVED"]).default("DRAFT"),
   isFeatured: z.boolean().default(false),
   videoUrl: z.string().max(500).optional().nullable(),
   weightGrams: nonNegativeInt.optional().nullable(),
-  dimensions: z.object({ length: z.number().optional(), width: z.number().optional(), height: z.number().optional() }).optional().nullable(),
+  dimensions: z.object({
+    length: z.number().finite().nonnegative().optional(),
+    width: z.number().finite().nonnegative().optional(),
+    height: z.number().finite().nonnegative().optional(),
+  }).strict().optional().nullable(),
   attributes: z.array(z.string().min(1).max(80)).max(20).default([]),
   specifications: z.array(attributeSchema).max(50).default([]),
   images: z.array(z.object({ url: z.string().max(500), alt: z.string().max(200).optional(), kind: z.enum(["IMAGE", "VIDEO"]).default("IMAGE") })).max(30).default([]),
@@ -52,11 +65,31 @@ async function ensureUniqueSlug(base: string, excludeId?: string) {
   throw new ConflictError("Could not generate a unique slug");
 }
 
+async function requireActiveCategory(tx: Prisma.TransactionClient, categoryId: string | null | undefined) {
+  if (!categoryId) return;
+  // Hold a share lock through the product transaction. A concurrent category
+  // deactivation/deletion must finish either before this check or after the
+  // assignment commits; a plain read would leave a check-then-write race.
+  const [category] = await tx.$queryRaw<Array<{ isActive: boolean }>>`
+    SELECT "isActive" FROM "Category" WHERE "id" = ${categoryId} FOR SHARE
+  `;
+  if (!category?.isActive) throw new ConflictError("Choose an active category");
+}
+
 export async function createProduct(input: ProductInput, actorId?: string) {
   const data = productSchema.parse(input);
+  if (data.expectedCategoryId !== undefined) throw new ConflictError("A new product cannot include an existing category snapshot");
+  const variants = data.variants.map((variant) => {
+    if (variant.id || variant.expectedStock !== undefined || variant.expectedUpdatedAt !== undefined || variant.expectedAttributes !== undefined) {
+      throw new ConflictError("A new product cannot reference an existing variant");
+    }
+    if (variant.attributes === undefined) throw new ConflictError(`New variant "${variant.name}" must include an attribute array`);
+    return { ...variant, attributes: variant.attributes };
+  });
   const slug = await ensureUniqueSlug(data.slug ? slugify(data.slug) : slugify(data.name));
   const publishedAt = data.status === "PUBLISHED" ? new Date() : null;
   const product = await prisma.$transaction(async (tx) => {
+    await requireActiveCategory(tx, data.categoryId);
     const created = await tx.product.create({
       data: {
         name: data.name, slug, sku: data.sku ?? null,
@@ -64,12 +97,12 @@ export async function createProduct(input: ProductInput, actorId?: string) {
         regularPrice: data.regularPrice, salePrice: data.salePrice ?? null,
         categoryId: data.categoryId || null, status: data.status, isFeatured: data.isFeatured,
         videoUrl: data.videoUrl || null, weightGrams: data.weightGrams ?? null,
-        dimensions: (data.dimensions ?? null) as never,
+        ...(data.dimensions === undefined ? {} : { dimensions: data.dimensions === null ? Prisma.DbNull : data.dimensions }),
         attributes: data.attributes as never, specifications: data.specifications as never,
         publishedAt, createdById: actorId ?? null,
         images: { create: data.images.map((image, index) => ({ url: image.url, alt: image.alt ?? null, kind: image.kind, position: index })) },
         variants: {
-          create: data.variants.map((variant, index) => ({
+          create: variants.map((variant, index) => ({
             name: variant.name, sku: variant.sku || null, price: variant.price ?? null,
             stock: variant.stock, lowStockThreshold: variant.lowStockThreshold,
             imageUrl: variant.imageUrl || null, attributes: variant.attributes as never,
@@ -95,46 +128,101 @@ export async function createProduct(input: ProductInput, actorId?: string) {
 
 export async function updateProduct(id: string, input: ProductInput, actorId?: string) {
   const data = productSchema.parse(input);
+  if (data.categoryId !== undefined && data.expectedCategoryId === undefined) {
+    throw new ConflictError("Category edit information is missing. Reload the product and try again");
+  }
   const existing = await prisma.product.findUnique({ where: { id }, include: { variants: true } });
   if (!existing) throw new NotFoundError("Product not found");
+  // Validate both the stored value and the original edit snapshot before any write.
+  for (const variant of existing.variants) {
+    normalizeStoredVariantAttributes(variant.attributes, { productName: existing.name, variantName: variant.name });
+  }
+  const submittedIds = new Set<string>();
+  for (const variant of data.variants) {
+    if (variant.id) {
+      if (submittedIds.has(variant.id)) throw new ConflictError("A variant was submitted more than once");
+      submittedIds.add(variant.id);
+      if (variant.expectedStock === undefined || !variant.expectedUpdatedAt || variant.expectedAttributes === undefined) {
+        throw new ConflictError("Variant edit information is missing. Reload the product and try again");
+      }
+      normalizeStoredVariantAttributes(variant.expectedAttributes, { productName: existing.name, variantName: variant.name });
+    } else {
+      if (variant.expectedStock !== undefined || variant.expectedUpdatedAt !== undefined || variant.expectedAttributes !== undefined) {
+        throw new ConflictError("A new variant cannot include an existing variant's edit information");
+      }
+      if (variant.attributes === undefined) throw new ConflictError(`New variant "${variant.name}" must include an attribute array`);
+    }
+  }
   const slug = await ensureUniqueSlug(data.slug ? slugify(data.slug) : existing.slug, id);
 
   const product = await prisma.$transaction(async (tx) => {
-    const updated = await tx.product.update({
-      where: { id },
+    const current = await tx.product.findUnique({ where: { id }, include: { variants: true } });
+    if (!current) throw new NotFoundError("Product not found");
+    for (const variant of current.variants) {
+      normalizeStoredVariantAttributes(variant.attributes, { productName: current.name, variantName: variant.name });
+    }
+    const currentIds = new Set(current.variants.map((variant) => variant.id));
+    if ([...submittedIds].some((variantId) => !currentIds.has(variantId))) {
+      throw new ConflictError("A submitted variant does not belong to this product");
+    }
+    // Never delete persisted variants through a product save: their order,
+    // movement and reservation references must remain intact.
+    if (current.variants.some((variant) => !submittedIds.has(variant.id))) {
+      throw new ConflictError("Existing variants cannot be removed here. Reload or deactivate the variant instead");
+    }
+    if (data.categoryId !== undefined && data.categoryId !== current.categoryId) {
+      await requireActiveCategory(tx, data.categoryId);
+    }
+
+    const result = await tx.product.updateMany({
+      where: { id, ...(data.categoryId === undefined ? {} : { categoryId: data.expectedCategoryId }) },
       data: {
         name: data.name, slug, sku: data.sku ?? null,
         shortDescription: data.shortDescription ?? null, description: data.description ?? null,
         regularPrice: data.regularPrice, salePrice: data.salePrice ?? null,
-        categoryId: data.categoryId || null, status: data.status, isFeatured: data.isFeatured,
+        ...(data.categoryId === undefined ? {} : { categoryId: data.categoryId }),
+        status: data.status, isFeatured: data.isFeatured,
         videoUrl: data.videoUrl || null, weightGrams: data.weightGrams ?? null,
-        dimensions: (data.dimensions ?? null) as never,
+        ...(data.dimensions === undefined ? {} : { dimensions: data.dimensions === null ? Prisma.DbNull : data.dimensions }),
         attributes: data.attributes as never, specifications: data.specifications as never,
-        publishedAt: data.status === "PUBLISHED" ? (existing.publishedAt ?? new Date()) : null,
+        publishedAt: data.status === "PUBLISHED" ? (current.publishedAt ?? new Date()) : null,
         archivedAt: data.status === "ARCHIVED" ? new Date() : null,
       },
     });
+    if (result.count !== 1) throw new ConflictError("Product category changed. Reload the product and try again");
+    const updated = await tx.product.findUniqueOrThrow({ where: { id } });
     await tx.productImage.deleteMany({ where: { productId: id } });
     await tx.productImage.createMany({
       data: data.images.map((image, index) => ({ productId: id, url: image.url, alt: image.alt ?? null, kind: image.kind, position: index })),
     });
-    const keepIds = data.variants.filter((v) => v.id).map((v) => v.id as string);
-    await tx.productVariant.deleteMany({ where: { productId: id, id: { notIn: keepIds } } });
     for (const [index, variant] of data.variants.entries()) {
       const values = {
         name: variant.name, sku: variant.sku || null, price: variant.price ?? null,
         stock: variant.stock, lowStockThreshold: variant.lowStockThreshold,
-        imageUrl: variant.imageUrl || null, attributes: variant.attributes as never,
+        imageUrl: variant.imageUrl || null,
+        ...(variant.attributes === undefined ? {} : { attributes: variant.attributes as Prisma.InputJsonValue }),
         isActive: variant.isActive, position: variant.position || index,
       };
-      if (variant.id && keepIds.includes(variant.id)) {
-        await tx.productVariant.update({ where: { id: variant.id }, data: values });
-        const oldVariant = existing.variants.find((v) => v.id === variant.id);
-        if (oldVariant && oldVariant.stock !== variant.stock) {
+      if (variant.id) {
+        if (variant.expectedStock === undefined || !variant.expectedUpdatedAt || variant.expectedAttributes === undefined) {
+          throw new ConflictError("Variant edit information is missing. Reload the product and try again");
+        }
+        // Compare the original stock and raw JSON as well as the version. This
+        // protects against concurrent writes even when timestamps share a millisecond.
+        const result = await tx.productVariant.updateMany({
+          where: {
+            id: variant.id, productId: id, stock: variant.expectedStock,
+            updatedAt: new Date(variant.expectedUpdatedAt),
+            attributes: { equals: variant.expectedAttributes as Prisma.InputJsonValue },
+          },
+          data: values,
+        });
+        if (result.count !== 1) throw new ConflictError(`Variant "${variant.name}" changed. Reload the product and try again`);
+        if (variant.expectedStock !== variant.stock) {
           await tx.stockMovement.create({
             data: {
               productId: id, variantId: variant.id, type: "ADJUSTMENT",
-              quantity: variant.stock - oldVariant.stock, balanceAfter: variant.stock,
+              quantity: variant.stock - variant.expectedStock, balanceAfter: variant.stock,
               reason: "Stock changed in product editor", createdById: actorId ?? null,
             },
           });
@@ -188,7 +276,7 @@ export async function duplicateProduct(id: string, actorId?: string) {
     variants: source.variants.map((variant, index) => ({
       name: variant.name, sku: null, price: variant.price, stock: 0,
       lowStockThreshold: variant.lowStockThreshold, imageUrl: variant.imageUrl,
-      attributes: variantAttributesSchema.parse(variant.attributes), isActive: variant.isActive, position: index,
+      attributes: normalizeStoredVariantAttributes(variant.attributes, { productName: source.name, variantName: variant.name }), isActive: variant.isActive, position: index,
     })),
   }, actorId);
 }

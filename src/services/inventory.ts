@@ -45,18 +45,23 @@ export async function adjustStock(
   return balanceAfter;
 }
 
-export async function setStock(variantId: string, stock: number, reason: string, actorId?: string) {
-  if (!Number.isInteger(stock) || stock < 0) throw new ConflictError("Stock must be a non-negative integer");
+export async function setStock(variantId: string, stock: number, expectedStock: number, reason: string, actorId?: string) {
+  if (![stock, expectedStock].every((value) => Number.isInteger(value) && value >= 0 && value <= 2_147_483_647)) {
+    throw new ConflictError("Stock must be a non-negative integer");
+  }
   return prisma.$transaction(async (tx) => {
     const variant = await tx.productVariant.findUnique({ where: { id: variantId } });
     if (!variant) throw new NotFoundError("Variant not found");
-    await tx.productVariant.update({ where: { id: variantId }, data: { stock } });
-    await tx.stockMovement.create({
-      data: {
-        productId: variant.productId, variantId, type: "ADJUSTMENT", quantity: stock - variant.stock,
-        balanceAfter: stock, reason, createdById: actorId ?? null,
-      },
-    });
+    const result = await tx.productVariant.updateMany({ where: { id: variantId, stock: expectedStock }, data: { stock } });
+    if (result.count !== 1) throw new ConflictError("Stock changed. Reload inventory and try again");
+    if (stock !== expectedStock) {
+      await tx.stockMovement.create({
+        data: {
+          productId: variant.productId, variantId, type: "ADJUSTMENT", quantity: stock - expectedStock,
+          balanceAfter: stock, reason, createdById: actorId ?? null,
+        },
+      });
+    }
     return stock;
   });
 }

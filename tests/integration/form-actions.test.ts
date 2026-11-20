@@ -116,6 +116,9 @@ describe("product form action and persistence", () => {
     });
     const updatedVariants = variants.map((variant, index) => ({
       ...variant, id: product.variants[index].id,
+      expectedStock: product.variants[index].stock,
+      expectedUpdatedAt: product.variants[index].updatedAt.toISOString(),
+      expectedAttributes: product.variants[index].attributes,
       attributes: index === 1 ? [{ name: "Size", value: "M" }, { name: "Color", value: "Green" }] : variant.attributes,
       isActive: index !== 1,
     }));

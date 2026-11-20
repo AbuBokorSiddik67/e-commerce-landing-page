@@ -6,6 +6,7 @@ import { ConflictError, NotFoundError } from "@/lib/errors";
 import { orderNumber, randomToken } from "@/lib/crypto";
 import { addressSchema, emailSchema, nameSchema, phoneSchema } from "@/lib/validation";
 import { lineTotals, validateCoupon } from "@/lib/pricing";
+import { normalizeStoredVariantAttributes } from "@/lib/product-attributes";
 import { assertPaymentMethodAvailable, calculateDeliveryCharge, getBusinessSettings, getCourierCredential, getPaymentCredential } from "@/lib/settings";
 import { getPaymentProvider } from "@/lib/payments/registry";
 import { getCourierProvider } from "@/lib/couriers/registry";
@@ -50,6 +51,9 @@ export async function placeOrder(raw: CheckoutInput) {
   const variant = product.variants.find((v) => v.id === input.variantId && v.isActive);
   if (!variant) throw new ConflictError("Selected variant is not available");
   if (variant.stock < input.quantity) throw new ConflictError(`Only ${variant.stock} units are available`);
+  // Validate the exact stored value that will become the order snapshot. Do not
+  // rewrite it: legacy snapshots and already-placed orders keep their shape.
+  normalizeStoredVariantAttributes(variant.attributes, { productName: product.name, variantName: variant.name });
 
   const duplicate = await prisma.order.findFirst({
     where: {
@@ -127,7 +131,7 @@ export async function placeOrder(raw: CheckoutInput) {
             unitPrice: totals.unitPrice,
             quantity: input.quantity,
             lineTotal: totals.subtotal,
-            attributes: (variant.attributes ?? {}) as never,
+            attributes: variant.attributes as never,
             imageUrl: variant.imageUrl || product.images[0]?.url || null,
           },
         },
