@@ -5,10 +5,11 @@ import { applyTemplateAction, publishPageAction, savePageAction } from "@/app/ac
 import { Button, Card, Field } from "@/components/ui";
 import { SectionRenderer, type RenderSection } from "@/components/public/SectionRenderer";
 import { SECTION_DEFAULTS, SECTION_LABELS, SECTION_TYPES, type SectionData, type SectionType } from "@/lib/page-sections";
+import type { PageSeo, PageSettings } from "@/lib/page-config";
 
 type PageData = {
   id: string; slug: string; title: string; status: string; templateCode: string;
-  theme: Record<string, string>; seo: Record<string, unknown>; settings: Record<string, unknown>;
+  theme: Record<string, string>; seo: PageSeo; settings: PageSettings;
   noIndex: boolean; scheduledFor: string | null;
   product: { name: string; slug: string; regularPrice: number; salePrice: number | null; images: Array<{ url: string; alt: string | null }> };
 };
@@ -20,12 +21,14 @@ export function PageBuilder({ page, sections, templates }: {
   const [selected, setSelected] = useState<string>(sections[0]?.id ?? "");
   const [preview, setPreview] = useState<"desktop" | "tablet" | "mobile">("desktop");
   const [theme, setTheme] = useState<Record<string, string>>(page.theme);
-  const [seo, setSeo] = useState<Record<string, string>>({ ...page.seo as Record<string, string>, noIndex: String(page.noIndex || (page.seo as { noIndex?: boolean }).noIndex || false) });
-  const [settings, setSettings] = useState<Record<string, string>>({
-    whatsappNumber: "", showStickyCta: "true", showRelatedProducts: "true", primaryCtaText: "Order Now",
-    ...(page.settings as Record<string, string>),
+  const [seo, setSeo] = useState({ ...page.seo, noIndex: page.noIndex || page.seo.noIndex === true });
+  const [settings, setSettings] = useState({
+    whatsappNumber: "", showStickyCta: true, showRelatedProducts: true, primaryCtaText: "Order Now",
+    ...page.settings,
   });
   const current = items.find((s) => s.id === selected);
+  // Added and duplicated sections use temporary editor IDs, not database IDs.
+  const savedSectionIds = new Set(sections.map((section) => section.id));
 
   function update(id: string, patch: Partial<RenderSection>) {
     setItems((list) => list.map((s) => (s.id === id ? { ...s, ...patch } : s)));
@@ -67,8 +70,10 @@ export function PageBuilder({ page, sections, templates }: {
         <input type="hidden" name="seo" value={JSON.stringify(seo)} />
         <input type="hidden" name="settings" value={JSON.stringify(settings)} />
         <input type="hidden" name="analytics" value="{}" />
-        <input type="hidden" name="noIndex" value={seo.noIndex === "true" ? "on" : ""} />
-        <input type="hidden" name="sections" value={JSON.stringify(items)} />
+        <input type="hidden" name="noIndex" value={String(seo.noIndex)} />
+        <input type="hidden" name="sections" value={JSON.stringify(items.map((section) => ({
+          ...section, id: savedSectionIds.has(section.id) ? section.id : undefined,
+        })))} />
       </form>
 
       <Card className="h-fit p-5">
@@ -83,8 +88,8 @@ export function PageBuilder({ page, sections, templates }: {
           </div>)}
         </div>
         <div className="mt-4 border-t border-ink-100 pt-4">
-          <label className="label">Add a section</label>
-          <select className="input" defaultValue="" onChange={(e) => { if (e.target.value) addSection(e.target.value as SectionType); e.target.value = ""; }}><option value="">Choose a block…</option>{SECTION_TYPES.map((type) => <option key={type} value={type}>{SECTION_LABELS[type]}</option>)}</select>
+          <label htmlFor="add-section" className="label">Add a section</label>
+          <select id="add-section" className="input" defaultValue="" onChange={(e) => { if (e.target.value) addSection(e.target.value as SectionType); e.target.value = ""; }}><option value="">Choose a block…</option>{SECTION_TYPES.map((type) => <option key={type} value={type}>{SECTION_LABELS[type]}</option>)}</select>
         </div>
         <div className="mt-4 border-t border-ink-100 pt-4">
           <label className="label">Start from a template</label>
@@ -125,8 +130,12 @@ export function PageBuilder({ page, sections, templates }: {
         <h2 className="font-semibold">Design & SEO</h2>
         <p className="mt-1 text-xs text-ink-500">Colours apply to this page only. Global branding is in Business Settings.</p>
         <div className="mt-4 space-y-3">{(["primary", "accent", "surface", "text", "radius"] as const).map((key) => <Field key={key} label={key} name={`theme-${key}`}><input className="input" value={theme[key] ?? ""} onChange={(e) => setTheme((t) => ({ ...t, [key]: e.target.value }))} /></Field>)}</div>
-        <div className="mt-5 border-t border-ink-100 pt-4"><h3 className="text-sm font-semibold">SEO</h3><div className="mt-3 space-y-3">{(["title", "description", "canonical", "ogImage"] as const).map((key) => <Field key={key} label={key} name={`seo-${key}`}><input className="input" value={seo[key] ?? ""} onChange={(e) => setSeo((s) => ({ ...s, [key]: e.target.value }))} /></Field>)}<label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={seo.noIndex === "true"} onChange={(e) => setSeo((s) => ({ ...s, noIndex: String(e.target.checked) }))} />Do not index this page</label></div></div>
-        <div className="mt-5 border-t border-ink-100 pt-4"><h3 className="text-sm font-semibold">Page options</h3><div className="mt-3 space-y-3">{(["whatsappNumber", "showStickyCta", "showRelatedProducts", "primaryCtaText"] as const).map((key) => <Field key={key} label={key} name={`settings-${key}`}><input className="input" value={settings[key] ?? ""} onChange={(e) => setSettings((s) => ({ ...s, [key]: e.target.value }))} /></Field>)}</div></div>
+        <div className="mt-5 border-t border-ink-100 pt-4"><h3 className="text-sm font-semibold">SEO</h3><div className="mt-3 space-y-3">{(["title", "description", "canonical", "ogImage"] as const).map((key) => <Field key={key} label={key} name={`seo-${key}`}><input id={`seo-${key}`} className="input" value={seo[key] ?? ""} onChange={(e) => setSeo((s) => ({ ...s, [key]: e.target.value }))} /></Field>)}<label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={seo.noIndex} onChange={(e) => setSeo((s) => ({ ...s, noIndex: e.target.checked }))} />Do not index this page</label></div></div>
+        <div className="mt-5 border-t border-ink-100 pt-4"><h3 className="text-sm font-semibold">Page options</h3><div className="mt-3 space-y-3">
+          {(["whatsappNumber", "primaryCtaText"] as const).map((key) => <Field key={key} label={key} name={`settings-${key}`}><input id={`settings-${key}`} className="input" value={settings[key] ?? ""} onChange={(e) => setSettings((s) => ({ ...s, [key]: e.target.value }))} /></Field>)}
+          <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={settings.showStickyCta} onChange={(e) => setSettings((s) => ({ ...s, showStickyCta: e.target.checked }))} />Show sticky call to action</label>
+          <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={settings.showRelatedProducts} onChange={(e) => setSettings((s) => ({ ...s, showRelatedProducts: e.target.checked }))} />Show related products</label>
+        </div></div>
       </Card>
     </div>
   );

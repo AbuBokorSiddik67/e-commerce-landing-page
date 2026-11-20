@@ -2,6 +2,12 @@
 
 Last updated: 2026-11-19
 
+## Form validation follow-up
+
+- Product variant attributes now use one array-of-name/value-pairs shape in the editor, validation, seed and `ProductVariant` JSON storage. Migration `20261120050000_normalize_variant_attributes` converts legacy objects and changes the empty default; deploy it before using the updated editor.
+- Builder SEO and option checkboxes submit booleans. Recognized older boolean strings are normalized at the form boundary; invalid values and malformed JSON are rejected rather than silently discarded.
+- Regression tests exercise the rendered forms, server actions, real PostgreSQL persistence, checkbox states and legacy migration. The suite passed 49 tests across 12 files; lint and typecheck passed. The production build passed during the form-validation follow-up. All four Playwright tests passed, including product creation/update and builder saves with checked and unchecked options.
+
 ## Repository baseline
 
 The repository contained only `AI_INSTRUCTIONS.md` and an empty `README.md`; there was no existing framework, dependency set or application code to preserve. A greenfield Next.js implementation was therefore appropriate. `AI_INSTRUCTIONS.md` has not been modified.
@@ -27,7 +33,7 @@ The repository contained only `AI_INSTRUCTIONS.md` and an empty `README.md`; the
 | 14 — Marketing features | Complete | Coupon rules, review moderation, analytics, Meta/GA/GTM controls |
 | 15 — Notifications | Complete | In-app, SMTP, SMS gateway, channel switches and delivery logs |
 | 16 — Online payment completion | Blocked externally | Awaiting merchant credentials/approval; see below |
-| 17 — Security and testing | Complete within environment | 33 passing tests, security headers, validation, audit, encryption; Playwright not executed |
+| 17 — Security and testing | Complete within environment | 49 Vitest tests and 4 Playwright tests passed; security headers, validation, audit and encryption |
 | 18 — Performance and reliability | Partially complete | Indexed queries, SSR dynamic pages, image lazy loading, Next Image-compatible URLs, encrypted backup script; multi-instance caching/limiter not implemented |
 | 19 — Deployment and documentation | Complete | Docker Compose, production build, Nginx, env docs, backup/restore guide, all required docs |
 
@@ -43,7 +49,8 @@ Authentication/RBAC, dashboard shell, business settings, products, categories, v
 
 - `npm run typecheck`: passed.
 - `npm run lint`: passed, no warnings or errors.
-- `npm test`: 33/33 tests passed against a real PostgreSQL test database.
+- `npm test`: 49/49 tests passed against a real PostgreSQL test database.
+- `npm run test:e2e`: 4/4 Playwright tests passed against a seeded local database using temporary Chromium 153.
 - `npm run build`: production build passed.
 - HTTP smoke checks: all public pages, `/p/[slug]`, `/track/[token]`, sitemap, robots, health and all 21 dashboard pages returned 200; builder page rendered.
 - Real application-level COD order via `/api/orders`: order `LDQ-20261119-A62BF1`, total ৳1,640, stock reduced 25 → 23, no gateway transaction.
@@ -65,6 +72,7 @@ Core COD workflow, manual courier workflow, inventory deduction/restoration, RBA
 - Redis/shared rate limiting: process-local limiter is implemented; multi-instance limiter is not.
 - Video section: renders a labelled placeholder; direct embeddable video URL field exists in section data but no iframe renderer was added for safety.
 - Daily analytics summary table exists but analytics currently query events/orders directly; the summary is not populated by a scheduled job.
+- The builder persists `showStickyCta` as a boolean, but the public renderer does not currently render a sticky CTA from that setting.
 
 ## Not implemented
 
@@ -79,11 +87,10 @@ Core COD workflow, manual courier workflow, inventory deduction/restoration, RBA
 - Nagad merchant ID and RSA public/private keys with gateway approval.
 - Pathao client ID/secret, Steadfast API key/secret, REDX API key.
 - SMTP/SMS credentials, Meta CAPI access token, S3 bucket credentials for a specific buyer.
-- Playwright Chromium download (`cdn.playwright.dev` blocked) and a system browser for E2E execution.
 
 ## Known bugs
 
-None discovered in the executed test suite or HTTP smoke checks. Two issues were found and fixed during verification: an invalid `Intl.DateTimeFormat` option combination on the tracking page, and a public tracking query that initially returned internal order fields (now replaced by an explicit allow-list).
+No failing tests remain. Two earlier issues were fixed during verification: an invalid `Intl.DateTimeFormat` option combination on the tracking page, and a public tracking query that initially returned internal order fields (now replaced by an explicit allow-list). The dependency audit currently reports 14 vulnerabilities (4 moderate, 8 high, 2 critical); resolving them, including major-version upgrades, is separate from the form-validation change.
 
 ## Failed tests
 

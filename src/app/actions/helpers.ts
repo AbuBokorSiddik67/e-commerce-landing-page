@@ -1,14 +1,16 @@
 import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { toErrorMessage } from "@/lib/errors";
+import { normalizeBooleanLiteral } from "@/lib/form-boolean";
 
 export function jsonField<T>(formData: FormData, key: string, fallback: T): T {
   const raw = formData.get(key);
-  if (typeof raw !== "string" || !raw.trim()) return fallback;
+  if (raw === null || (typeof raw === "string" && !raw.trim())) return fallback;
+  if (typeof raw !== "string") throw new Error(`${key} must be JSON text`);
   try {
     return JSON.parse(raw) as T;
   } catch {
-    return fallback;
+    throw new Error(`Invalid JSON for ${key}`);
   }
 }
 
@@ -18,7 +20,11 @@ export function str(formData: FormData, key: string, fallback = "") {
 }
 
 export function bool(formData: FormData, key: string) {
-  return formData.get(key) === "on" || formData.get(key) === "true";
+  const value = formData.get(key);
+  if (value === null || value === "") return false;
+  const normalized = normalizeBooleanLiteral(value);
+  if (typeof normalized === "boolean") return normalized;
+  throw new Error(`Invalid checkbox value for ${key}`);
 }
 
 export function num(formData: FormData, key: string, fallback = 0) {

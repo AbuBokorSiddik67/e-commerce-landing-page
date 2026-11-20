@@ -4,14 +4,7 @@ import { audit } from "@/lib/audit";
 import { ConflictError, NotFoundError } from "@/lib/errors";
 import { slugSchema } from "@/lib/validation";
 import { SECTION_TYPES, SECTION_DEFAULTS, sectionsFromTemplate, sectionDataSchema } from "@/lib/page-sections";
-
-const seoSchema = z.object({
-  title: z.string().max(180).optional(),
-  description: z.string().max(400).optional(),
-  canonical: z.string().max(500).optional(),
-  ogImage: z.string().max(500).optional(),
-  noIndex: z.boolean().optional(),
-}).default({});
+import { pageSettingsSchema, seoSchema } from "@/lib/page-config";
 
 const sectionSchema = z.object({
   id: z.string().optional(),
@@ -30,12 +23,7 @@ export const pageSchema = z.object({
   theme: z.record(z.string()).default({}),
   seo: seoSchema,
   analytics: z.record(z.string()).default({}),
-  settings: z.object({
-    whatsappNumber: z.string().max(30).optional(),
-    showStickyCta: z.boolean().optional(),
-    showRelatedProducts: z.boolean().optional(),
-    primaryCtaText: z.string().max(80).optional(),
-  }).default({}),
+  settings: pageSettingsSchema,
   noIndex: z.boolean().default(false),
   sections: z.array(sectionSchema).default([]),
 });

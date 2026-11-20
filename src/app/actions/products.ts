@@ -1,42 +1,40 @@
 "use server";
-import { revalidatePath } from "next/cache";
-import { redirect } from "next/navigation";
 import { requirePermission } from "@/lib/auth";
 import { PERMISSIONS } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 import { slugify } from "@/lib/utils";
 import { ConflictError } from "@/lib/errors";
-import { createProduct, deleteProduct, duplicateProduct, setProductStatus, updateProduct } from "@/services/products";
+import { createProduct, deleteProduct, duplicateProduct, productSchema, setProductStatus, updateProduct } from "@/services/products";
 import { setStock } from "@/services/inventory";
 import { bool, finish, jsonField, num, optionalStr, str } from "./helpers";
 
 function productInput(formData: FormData) {
-  return {
+  return productSchema.parse({
     name: str(formData, "name"),
     slug: str(formData, "slug") || undefined,
     sku: optionalStr(formData, "sku"),
     shortDescription: optionalStr(formData, "shortDescription"),
     description: optionalStr(formData, "description"),
-    regularPrice: num(formData, "regularPrice"),
-    salePrice: optionalStr(formData, "salePrice") ? num(formData, "salePrice") : null,
+    regularPrice: str(formData, "regularPrice"),
+    salePrice: optionalStr(formData, "salePrice"),
     categoryId: optionalStr(formData, "categoryId"),
-    status: str(formData, "status", "DRAFT") as "DRAFT" | "PUBLISHED" | "ARCHIVED",
+    status: str(formData, "status", "DRAFT"),
     isFeatured: bool(formData, "isFeatured"),
     videoUrl: optionalStr(formData, "videoUrl"),
-    weightGrams: optionalStr(formData, "weightGrams") ? num(formData, "weightGrams") : null,
-    dimensions: jsonField<{ length?: number; width?: number; height?: number } | null>(formData, "dimensions", null),
-    attributes: jsonField<string[]>(formData, "attributes", []),
-    specifications: jsonField<{ name: string; value: string }[]>(formData, "specifications", []),
-    images: jsonField<{ url: string; alt?: string; kind: "IMAGE" | "VIDEO" }[]>(formData, "images", []),
-    variants: jsonField<Array<{ id?: string; name: string; sku?: string; price?: number | null; stock: number; lowStockThreshold: number; imageUrl?: string; attributes: Array<{ name: string; value: string }>; isActive: boolean; position: number }>>(formData, "variants", []),
-  };
+    weightGrams: optionalStr(formData, "weightGrams"),
+    dimensions: jsonField<unknown>(formData, "dimensions", null),
+    attributes: jsonField<unknown>(formData, "attributes", []),
+    specifications: jsonField<unknown>(formData, "specifications", []),
+    images: jsonField<unknown>(formData, "images", []),
+    variants: jsonField<unknown>(formData, "variants", []),
+  });
 }
 
 export async function saveProductAction(formData: FormData) {
   const user = await requirePermission(PERMISSIONS.PRODUCT_WRITE);
   const id = str(formData, "id");
-  const input = productInput(formData);
   await finish("/dashboard/products", async () => {
+    const input = productInput(formData);
     if (id) await updateProduct(id, input, user.id);
     else {
       const product = await createProduct(input, user.id);

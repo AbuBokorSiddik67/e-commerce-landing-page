@@ -44,6 +44,7 @@ describe("product management", () => {
     const copy = await duplicateProduct(product.id, owner.id);
     expect(copy.name).toContain("Copy");
     expect(copy.status).toBe("DRAFT");
+    expect(copy.variants[0].attributes).toEqual(productInput.variants[0].attributes);
     const listed = await listProducts({ search: "Test Shirt" });
     expect(listed.total).toBe(2);
   });

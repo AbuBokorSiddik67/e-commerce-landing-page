@@ -4,24 +4,23 @@ import { requirePermission } from "@/lib/auth";
 import { PERMISSIONS } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 import { slugify } from "@/lib/utils";
-import { applyTemplate, createLandingPage, publishLandingPage, updateLandingPage, type PageInput } from "@/services/pages";
+import { applyTemplate, createLandingPage, pageSchema, publishLandingPage, updateLandingPage } from "@/services/pages";
+import { normalizePageSeo, normalizePageSettings } from "@/lib/page-config";
 import { bool, finish, jsonField, optionalStr, str } from "./helpers";
 
-type PagePayload = PageInput;
-
-function payload(formData: FormData): PagePayload {
-  return {
+function payload(formData: FormData) {
+  return pageSchema.parse({
     title: str(formData, "title"), slug: slugify(str(formData, "slug")),
     templateCode: str(formData, "templateCode", "general"),
-    status: str(formData, "status", "DRAFT") as PagePayload["status"],
+    status: str(formData, "status", "DRAFT"),
     scheduledFor: optionalStr(formData, "scheduledFor"),
-    theme: jsonField(formData, "theme", {}),
-    seo: jsonField(formData, "seo", {}),
-    analytics: jsonField(formData, "analytics", {}),
-    settings: jsonField(formData, "settings", {}),
+    theme: jsonField<unknown>(formData, "theme", {}),
+    seo: normalizePageSeo(jsonField<unknown>(formData, "seo", {})),
+    analytics: jsonField<unknown>(formData, "analytics", {}),
+    settings: normalizePageSettings(jsonField<unknown>(formData, "settings", {})),
     noIndex: bool(formData, "noIndex"),
-    sections: jsonField(formData, "sections", []) as PageInput["sections"],
-  };
+    sections: jsonField<unknown>(formData, "sections", []),
+  });
 }
 
 export async function createPageAction(formData: FormData) {

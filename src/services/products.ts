@@ -4,8 +4,7 @@ import { audit } from "@/lib/audit";
 import { ConflictError, NotFoundError } from "@/lib/errors";
 import { slugify } from "@/lib/utils";
 import { nonNegativeInt, slugSchema } from "@/lib/validation";
-
-const attributeSchema = z.object({ name: z.string().min(1).max(80), value: z.string().max(120) });
+import { attributeSchema, variantAttributesSchema } from "@/lib/product-attributes";
 
 export const variantSchema = z.object({
   id: z.string().optional(),
@@ -15,7 +14,7 @@ export const variantSchema = z.object({
   stock: nonNegativeInt.default(0),
   lowStockThreshold: nonNegativeInt.default(5),
   imageUrl: z.string().max(500).optional().nullable(),
-  attributes: z.array(attributeSchema).max(10).default([]),
+  attributes: variantAttributesSchema.default([]),
   isActive: z.boolean().default(true),
   position: z.number().int().min(0).default(0),
 });
@@ -189,7 +188,7 @@ export async function duplicateProduct(id: string, actorId?: string) {
     variants: source.variants.map((variant, index) => ({
       name: variant.name, sku: null, price: variant.price, stock: 0,
       lowStockThreshold: variant.lowStockThreshold, imageUrl: variant.imageUrl,
-      attributes: (variant.attributes as { name: string; value: string }[]) ?? [], isActive: variant.isActive, position: index,
+      attributes: variantAttributesSchema.parse(variant.attributes), isActive: variant.isActive, position: index,
     })),
   }, actorId);
 }

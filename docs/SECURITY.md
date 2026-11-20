@@ -17,6 +17,7 @@
 
 - The default rate limiter is per process. Run one application instance or add a shared Redis-compatible limiter before horizontal scaling.
 - CSP includes `'unsafe-inline'` and `'unsafe-eval'` for Next.js and optional marketing script injection. Tighten with nonces if your deployment requires a stricter policy.
+- An explicit `LANDIQ_PREVIEW_EMBED=1` flag omits `X-Frame-Options` only in development for cross-origin sandbox previews. Do not use it for normal development; production always retains the header.
 - SMTP/SMS channels are logged as `SKIPPED` when credentials are absent; the system never claims delivery in that case.
 - Provider adapters were reviewed against documented API structures but could not be executed against live merchant accounts; see [IMPLEMENTATION_PROGRESS.md](IMPLEMENTATION_PROGRESS.md).
 - Backups are encrypted only as strongly as the operator's `BACKUP_PASSPHRASE`; store the passphrase separately and test restores.

@@ -40,6 +40,12 @@ updateMany({ where: { id, stock: { gte: quantity } }, data: { stock: { decrement
 
 A zero-count update is converted to a conflict instead of allowing negative stock.
 
+## Variant attribute storage and upgrade
+
+`ProductVariant.attributes` uses a JSON array of `{ "name": "Size", "value": "M" }` pairs; the empty default is `[]`. Before deploying the updated product editor, back up the database and run `npm run prisma:deploy`. Migration `20261120050000_normalize_variant_attributes` converts existing object-shaped variant attributes to arrays, leaves existing arrays intact, and preserves variant IDs and relationships. It changes only the JSON column's default, not its type or relationships.
+
+The migration preserves the JSON type of each legacy value instead of silently changing or discarding it. Non-string values remain invalid under the existing Zod schema and need operator review. Historical `OrderItem.attributes` snapshots are not rewritten.
+
 ## Migrations and data retention
 
 ```bash
