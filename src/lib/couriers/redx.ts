@@ -1,8 +1,8 @@
 import { request, type CourierProvider } from "./types";
 
 type Credentials = Record<string, string>;
-const apiBase = (sandbox: boolean) =>
-  process.env.REDX_API_BASE || (sandbox ? "https://sandboxapi.redx.com.bd/v1" : "https://api.redx.com.bd/v1");
+const apiBase = (sandbox: boolean, override?: string | null) =>
+  (override === undefined ? process.env.REDX_API_BASE : override) || (sandbox ? "https://sandboxapi.redx.com.bd/v1" : "https://api.redx.com.bd/v1");
 
 export const redxProvider: CourierProvider = {
   code: "redx",
@@ -34,12 +34,13 @@ export const redxProvider: CourierProvider = {
   },
 
   async createShipment(input) {
-    const auth = await request<{ token?: string; message?: string }>(`${apiBase(input.sandbox)}/auth/token`, {
+    const base = apiBase(input.sandbox, input.apiBaseOverride);
+    const auth = await request<{ token?: string; message?: string }>(`${base}/auth/token`, {
       method: "POST", headers: { "Content-Type": "application/json", "X-API-KEY": input.credentials.apiKey }, body: "{}",
     });
     if (!auth.token) throw new Error(auth.message ?? "REDX authentication failed");
     const result = await request<{ parcel?: { id?: string; tracking_id?: string; delivery_fee?: number }; message?: string }>(
-      `${apiBase(input.sandbox)}/parcel`,
+      `${base}/parcel`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${auth.token}` },

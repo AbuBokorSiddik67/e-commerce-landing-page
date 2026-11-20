@@ -6,9 +6,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // This suite uses only in-memory Prisma mocks; it never connects to a database.
 const mocks = vi.hoisted(() => ({
-  findProduct: vi.fn(), findCategories: vi.fn(), lockCategory: vi.fn(), transaction: vi.fn(), productUpdate: vi.fn(), productCreate: vi.fn(),
+  findProduct: vi.fn(), findCategories: vi.fn(), lockCategory: vi.fn(), lockVariant: vi.fn(), transaction: vi.fn(), productUpdate: vi.fn(), productCreate: vi.fn(),
   imageDeleteMany: vi.fn(), imageCreateMany: vi.fn(), variantDeleteMany: vi.fn(),
-  variantUpdateMany: vi.fn(), variantCreate: vi.fn(), movementCreate: vi.fn(), movementCreateMany: vi.fn(),
+  variantUpdateMany: vi.fn(), variantCreate: vi.fn(), movementCount: vi.fn(), movementCreate: vi.fn(), movementCreateMany: vi.fn(),
   orderUpdate: vi.fn(), orderItemUpdate: vi.fn(), orderItemUpdateMany: vi.fn(), orderItemDeleteMany: vi.fn(),
   landingPageCreate: vi.fn(), audit: vi.fn(), requirePermission: vi.fn(), revalidatePath: vi.fn(),
 }));
@@ -22,7 +22,7 @@ vi.mock("@/lib/prisma", () => ({
   },
 }));
 vi.mock("@/lib/audit", () => ({ audit: mocks.audit }));
-vi.mock("@/lib/auth", () => ({ requirePermission: mocks.requirePermission }));
+vi.mock("@/lib/auth", () => ({ requirePermission: mocks.requirePermission, requirePageAccess: vi.fn().mockResolvedValue({ id: "fixture-viewer" }) }));
 vi.mock("next/cache", () => ({ revalidatePath: mocks.revalidatePath }));
 vi.mock("next/navigation", () => ({
   redirect: (location: string) => { throw new Error(`TEST_REDIRECT:${location}`); },
@@ -46,7 +46,7 @@ type SourceProduct = {
   category?: { id: string; name: string; isActive: boolean } | null;
   specifications: Array<{ name: string; value: string }>; publishedAt: Date | null;
   images: Array<{ url: string; alt: string | null; kind: "IMAGE" | "VIDEO" }>;
-  variants: Array<VariantWrite & { id: string; productId: string; updatedAt: Date }>;
+  variants: Array<VariantWrite & { id: string; productId: string; updatedAt: Date; _count: { movements: number } }>;
 };
 
 function sourceProduct(): SourceProduct {
@@ -59,10 +59,10 @@ function sourceProduct(): SourceProduct {
     variants: [
       { id: "variant-1", productId: "product-1", name: "Medium", sku: "M", price: null, stock: 7,
         lowStockThreshold: 2, imageUrl: null, attributes: { Size: "M, tall", Color: "Black" } as unknown, isActive: true, position: 0,
-        updatedAt: new Date("2025-01-01T00:00:00.000Z") },
+        updatedAt: new Date("2025-01-01T00:00:00.000Z"), _count: { movements: 0 } },
       { id: "variant-2", productId: "product-1", name: "Small", sku: "S", price: null, stock: 3,
         lowStockThreshold: 2, imageUrl: null, attributes: [{ name: "Size", value: "S" }] as unknown, isActive: true, position: 1,
-        updatedAt: new Date("2025-01-01T00:00:01.000Z") },
+        updatedAt: new Date("2025-01-01T00:00:01.000Z"), _count: { movements: 0 } },
     ],
   };
 }
@@ -75,10 +75,11 @@ let copies: Array<{ id: string; name: string; slug: string; status: string; vari
 
 const tx = {
   product: { findUnique: mocks.findProduct, findUniqueOrThrow: mocks.findProduct, updateMany: mocks.productUpdate, create: mocks.productCreate },
-  $queryRaw: mocks.lockCategory,
+  $queryRaw: (sql: TemplateStringsArray, ...values: string[]) => sql.join("?").includes('"ProductVariant"')
+    ? mocks.lockVariant(sql, ...values) : mocks.lockCategory(sql, ...values),
   productImage: { deleteMany: mocks.imageDeleteMany, createMany: mocks.imageCreateMany },
   productVariant: { deleteMany: mocks.variantDeleteMany, updateMany: mocks.variantUpdateMany, create: mocks.variantCreate },
-  stockMovement: { create: mocks.movementCreate, createMany: mocks.movementCreateMany },
+  stockMovement: { count: mocks.movementCount, create: mocks.movementCreate, createMany: mocks.movementCreateMany },
   order: { update: mocks.orderUpdate },
   orderItem: { update: mocks.orderItemUpdate, updateMany: mocks.orderItemUpdateMany, deleteMany: mocks.orderItemDeleteMany },
 };
@@ -94,6 +95,14 @@ beforeEach(() => {
     if (categoryId === "active-category") return [{ isActive: true }];
     if (categoryId === "inactive-category") return [{ isActive: false }];
     return [];
+  });
+  mocks.lockVariant.mockImplementation(async (_sql: TemplateStringsArray, variantId: string, productId: string) =>
+    product.variants.some((variant) => variant.id === variantId && variant.productId === productId) ? [{ id: variantId }] : []);
+  mocks.movementCount.mockImplementation(async ({ where }: { where: { variantId: string } }) =>
+    product.variants.find((variant) => variant.id === where.variantId)?._count.movements ?? 0);
+  mocks.movementCreate.mockImplementation(async ({ data }: { data: { variantId: string } }) => {
+    const variant = product.variants.find((value) => value.id === data.variantId);
+    if (variant) variant._count.movements++;
   });
   mocks.audit.mockResolvedValue(undefined);
   mocks.findProduct.mockImplementation(async ({ where }: { where: { id?: string; slug?: string } }) => {
@@ -112,8 +121,9 @@ beforeEach(() => {
       throw error;
     }
   });
-  mocks.productUpdate.mockImplementation(async ({ where, data }: { where: { id: string; categoryId?: string | null }; data: Record<string, unknown> }) => {
-    if (where.id !== product.id || (where.categoryId !== undefined && where.categoryId !== product.categoryId)) return { count: 0 };
+  mocks.productUpdate.mockImplementation(async ({ where, data }: { where: { id: string; status?: string; categoryId?: string | null }; data: Record<string, unknown> }) => {
+    if (where.id !== product.id || (where.status !== undefined && where.status !== product.status)
+      || (where.categoryId !== undefined && where.categoryId !== product.categoryId)) return { count: 0 };
     const applied = { ...data };
     if (applied.dimensions === Prisma.DbNull) applied.dimensions = null;
     product = { ...product, ...applied };
@@ -135,7 +145,7 @@ beforeEach(() => {
     return { count: 1 };
   });
   mocks.variantCreate.mockImplementation(async ({ data }: { data: VariantWrite & { productId: string } }) => {
-    const created = { ...data, id: "variant-new", updatedAt: new Date("2025-01-02T00:00:00.000Z") };
+    const created = { ...data, id: "variant-new", updatedAt: new Date("2025-01-02T00:00:00.000Z"), _count: { movements: 0 } };
     product.variants.push(created);
     return structuredClone(created);
   });
@@ -155,14 +165,18 @@ afterEach(cleanup);
 
 function productForm(firstAttributes: unknown, existing = true) {
   const form = new FormData();
-  if (existing) form.set("id", product.id);
+  if (existing) {
+    form.set("id", product.id);
+    form.set("expectedStatus", product.status);
+  }
   form.set("name", existing ? "Updated cotton shirt" : "New cotton shirt");
   form.set("slug", existing ? product.slug : "new-cotton-shirt");
   form.set("regularPrice", "500");
   form.set("status", "DRAFT");
   form.set("attributes", JSON.stringify(product.attributes));
   form.set("variants", JSON.stringify(product.variants.map((variant, index) => ({
-    ...(existing ? { id: variant.id, expectedStock: variant.stock, expectedUpdatedAt: variant.updatedAt.toISOString(), expectedAttributes: variant.attributes } : {}),
+    ...(existing ? { id: variant.id, expectedStock: variant.stock, expectedMovementCount: variant._count.movements,
+      expectedUpdatedAt: variant.updatedAt.toISOString(), expectedAttributes: variant.attributes } : {}),
     name: variant.name, sku: existing ? variant.sku : null,
     price: variant.price, stock: variant.stock, lowStockThreshold: variant.lowStockThreshold,
     imageUrl: variant.imageUrl, attributes: index === 0 ? firstAttributes : variant.attributes,
@@ -468,6 +482,7 @@ describe("variant attribute product flows with mocked Prisma", () => {
     const submitted = new FormData(form);
     expect(submitted.get("categoryId")).toBe("inactive-category");
     expect(submitted.get("expectedCategoryId")).toBe("inactive-category");
+    expect(submitted.get("expectedStatus")).toBe(product.status);
     expect(submitted.has("dimensions")).toBe(false);
     const result = await submit(saveProductAction, submitted);
     expect(result.searchParams.get("success")).toBe("Product updated");
@@ -475,7 +490,7 @@ describe("variant attribute product flows with mocked Prisma", () => {
     expect(product.dimensions).toEqual({ length: 10, width: 2.5, height: 3 });
     expect(mocks.lockCategory).not.toHaveBeenCalled();
     expect(mocks.productUpdate).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: "product-1", categoryId: "inactive-category" },
+      where: { id: "product-1", categoryId: "inactive-category", status: "DRAFT" },
       data: expect.not.objectContaining({ dimensions: expect.anything() }),
     }));
   });
@@ -546,6 +561,14 @@ describe("variant attribute product flows with mocked Prisma", () => {
     const result = await submit(saveProductAction, form);
     expect(result.searchParams.get("error")).toMatch(/category changed.*Reload/);
     expect(product).toEqual(before);
+  });
+
+  it("requires a publication-status snapshot for product edits", async () => {
+    const form = productForm([{ name: "Size", value: "M" }]);
+    form.delete("expectedStatus");
+    const result = await submit(saveProductAction, form);
+    expect(result.searchParams.get("error")).toMatch(/status edit information is missing/);
+    expect(mocks.transaction).not.toHaveBeenCalled();
   });
 
   it("requires a category snapshot when an update explicitly submits a category", async () => {

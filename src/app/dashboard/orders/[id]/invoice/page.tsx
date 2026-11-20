@@ -1,3 +1,5 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
 import { getBusinessSettings } from "@/lib/settings";
@@ -6,6 +8,7 @@ import { formatDate, formatMoney } from "@/lib/utils";
 export const dynamic = "force-dynamic";
 
 export default async function Invoice({ params }: { params: Promise<{ id: string }> }) {
+  await requirePageAccess(PERMISSIONS.ORDER_VIEW);
   const { id } = await params;
   const [order, business] = await Promise.all([
     prisma.order.findUnique({ where: { id }, include: { customer: true, items: true } }),

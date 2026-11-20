@@ -6,6 +6,7 @@ import { ConflictError, NotFoundError } from "@/lib/errors";
 import { slugify } from "@/lib/utils";
 import { nonNegativeInt, slugSchema } from "@/lib/validation";
 import { attributeSchema, normalizeStoredVariantAttributes, variantAttributesSchema } from "@/lib/product-attributes";
+import { compareStableIds } from "@/lib/inventory-invariants";
 
 const stockSchema = z.number().int().min(0).max(2_147_483_647);
 
@@ -21,6 +22,7 @@ export const variantSchema = z.object({
   attributes: variantAttributesSchema.optional(),
   // These are edit preconditions, not attributes to persist.
   expectedStock: stockSchema.optional(),
+  expectedMovementCount: z.number().int().nonnegative().safe().optional(),
   expectedUpdatedAt: z.string().datetime().optional(),
   expectedAttributes: z.unknown().optional(),
   isActive: z.boolean().default(true),
@@ -38,6 +40,8 @@ export const productSchema = z.object({
   categoryId: z.string().min(1).optional().nullable(),
   expectedCategoryId: z.string().min(1).optional().nullable(),
   status: z.enum(["DRAFT", "PUBLISHED", "ARCHIVED"]).default("DRAFT"),
+  // Status is an edit precondition, not persisted as a separate field.
+  expectedStatus: z.enum(["DRAFT", "PUBLISHED", "ARCHIVED"]).optional(),
   isFeatured: z.boolean().default(false),
   videoUrl: z.string().max(500).optional().nullable(),
   weightGrams: nonNegativeInt.optional().nullable(),
@@ -78,9 +82,12 @@ async function requireActiveCategory(tx: Prisma.TransactionClient, categoryId: s
 
 export async function createProduct(input: ProductInput, actorId?: string) {
   const data = productSchema.parse(input);
-  if (data.expectedCategoryId !== undefined) throw new ConflictError("A new product cannot include an existing category snapshot");
+  if (data.expectedCategoryId !== undefined || data.expectedStatus !== undefined) {
+    throw new ConflictError("A new product cannot include an existing category or status snapshot");
+  }
   const variants = data.variants.map((variant) => {
-    if (variant.id || variant.expectedStock !== undefined || variant.expectedUpdatedAt !== undefined || variant.expectedAttributes !== undefined) {
+    if (variant.id || variant.expectedStock !== undefined || variant.expectedMovementCount !== undefined
+      || variant.expectedUpdatedAt !== undefined || variant.expectedAttributes !== undefined) {
       throw new ConflictError("A new product cannot reference an existing variant");
     }
     if (variant.attributes === undefined) throw new ConflictError(`New variant "${variant.name}" must include an attribute array`);
@@ -112,14 +119,14 @@ export async function createProduct(input: ProductInput, actorId?: string) {
       },
       include: { variants: true, images: true },
     });
-    if (data.status === "PUBLISHED") {
-      await tx.stockMovement.createMany({
-        data: created.variants.filter((v) => v.stock > 0).map((v) => ({
-          productId: created.id, variantId: v.id, type: "PURCHASE" as const,
-          quantity: v.stock, balanceAfter: v.stock, reason: "Initial stock", createdById: actorId ?? null,
-        })),
-      });
-    }
+    // Stock exists even while a product is a draft. Record its opening balance
+    // in the creation transaction rather than trying to infer it on publication.
+    await tx.stockMovement.createMany({
+      data: created.variants.filter((v) => v.stock > 0).map((v) => ({
+        productId: created.id, variantId: v.id, type: "PURCHASE" as const,
+        quantity: v.stock, balanceAfter: v.stock, reason: "Initial stock", createdById: actorId ?? null,
+      })),
+    });
     return created;
   });
   await audit({ actorId, action: "CREATE_PRODUCT", entity: "Product", entityId: product.id, after: { id: product.id, name: product.name, slug } });
@@ -128,6 +135,9 @@ export async function createProduct(input: ProductInput, actorId?: string) {
 
 export async function updateProduct(id: string, input: ProductInput, actorId?: string) {
   const data = productSchema.parse(input);
+  if (data.expectedStatus === undefined) {
+    throw new ConflictError("Product status edit information is missing. Reload the product and try again");
+  }
   if (data.categoryId !== undefined && data.expectedCategoryId === undefined) {
     throw new ConflictError("Category edit information is missing. Reload the product and try again");
   }
@@ -142,12 +152,14 @@ export async function updateProduct(id: string, input: ProductInput, actorId?: s
     if (variant.id) {
       if (submittedIds.has(variant.id)) throw new ConflictError("A variant was submitted more than once");
       submittedIds.add(variant.id);
-      if (variant.expectedStock === undefined || !variant.expectedUpdatedAt || variant.expectedAttributes === undefined) {
+      if (variant.expectedStock === undefined || variant.expectedMovementCount === undefined
+        || !variant.expectedUpdatedAt || variant.expectedAttributes === undefined) {
         throw new ConflictError("Variant edit information is missing. Reload the product and try again");
       }
       normalizeStoredVariantAttributes(variant.expectedAttributes, { productName: existing.name, variantName: variant.name });
     } else {
-      if (variant.expectedStock !== undefined || variant.expectedUpdatedAt !== undefined || variant.expectedAttributes !== undefined) {
+      if (variant.expectedStock !== undefined || variant.expectedMovementCount !== undefined
+        || variant.expectedUpdatedAt !== undefined || variant.expectedAttributes !== undefined) {
         throw new ConflictError("A new variant cannot include an existing variant's edit information");
       }
       if (variant.attributes === undefined) throw new ConflictError(`New variant "${variant.name}" must include an attribute array`);
@@ -175,7 +187,9 @@ export async function updateProduct(id: string, input: ProductInput, actorId?: s
     }
 
     const result = await tx.product.updateMany({
-      where: { id, ...(data.categoryId === undefined ? {} : { categoryId: data.expectedCategoryId }) },
+      // PostgreSQL rechecks this predicate after waiting on a concurrent row
+      // update, so an old editor cannot silently republish an archived item.
+      where: { id, status: data.expectedStatus, ...(data.categoryId === undefined ? {} : { categoryId: data.expectedCategoryId }) },
       data: {
         name: data.name, slug, sku: data.sku ?? null,
         shortDescription: data.shortDescription ?? null, description: data.description ?? null,
@@ -189,8 +203,20 @@ export async function updateProduct(id: string, input: ProductInput, actorId?: s
         archivedAt: data.status === "ARCHIVED" ? new Date() : null,
       },
     });
-    if (result.count !== 1) throw new ConflictError("Product category changed. Reload the product and try again");
+    if (result.count !== 1) {
+      const latest = await tx.product.findUnique({ where: { id }, select: { status: true } });
+      if (latest?.status !== data.expectedStatus) throw new ConflictError("Product status changed. Reload the product and try again");
+      throw new ConflictError("Product category changed. Reload the product and try again");
+    }
     const updated = await tx.product.findUniqueOrThrow({ where: { id } });
+    // Lock all persisted variants in the same stable order used by order
+    // restocking. This also makes the subsequent movement counts meaningful.
+    for (const variantId of [...submittedIds].sort(compareStableIds)) {
+      const locked = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT "id" FROM "ProductVariant" WHERE "id" = ${variantId} AND "productId" = ${id} FOR UPDATE
+      `;
+      if (!locked.length) throw new ConflictError("A product variant changed. Reload the product and try again");
+    }
     await tx.productImage.deleteMany({ where: { productId: id } });
     await tx.productImage.createMany({
       data: data.images.map((image, index) => ({ productId: id, url: image.url, alt: image.alt ?? null, kind: image.kind, position: index })),
@@ -204,11 +230,16 @@ export async function updateProduct(id: string, input: ProductInput, actorId?: s
         isActive: variant.isActive, position: variant.position || index,
       };
       if (variant.id) {
-        if (variant.expectedStock === undefined || !variant.expectedUpdatedAt || variant.expectedAttributes === undefined) {
+        if (variant.expectedStock === undefined || variant.expectedMovementCount === undefined
+          || !variant.expectedUpdatedAt || variant.expectedAttributes === undefined) {
           throw new ConflictError("Variant edit information is missing. Reload the product and try again");
         }
-        // Compare the original stock and raw JSON as well as the version. This
-        // protects against concurrent writes even when timestamps share a millisecond.
+        const movementCount = await tx.stockMovement.count({ where: { variantId: variant.id } });
+        if (movementCount !== variant.expectedMovementCount) {
+          throw new ConflictError(`Variant "${variant.name}" changed. Reload the product and try again`);
+        }
+        // Compare stock, ledger count and raw JSON as well as the timestamp.
+        // The count detects cooperating stock operations even on timestamp ABA.
         const result = await tx.productVariant.updateMany({
           where: {
             id: variant.id, productId: id, stock: variant.expectedStock,
@@ -282,26 +313,17 @@ export async function duplicateProduct(id: string, actorId?: string) {
 }
 
 export async function setProductStatus(id: string, status: "DRAFT" | "PUBLISHED" | "ARCHIVED", actorId?: string) {
-  const existing = await prisma.product.findUniqueOrThrow({ where: { id }, include: { variants: true } });
+  if (!["DRAFT", "PUBLISHED", "ARCHIVED"].includes(status)) throw new ConflictError("Invalid product status");
   const product = await prisma.$transaction(async (tx) => {
-    const updated = await tx.product.update({
+    const rows = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "Product" WHERE "id" = ${id} FOR UPDATE`;
+    if (!rows.length) throw new NotFoundError("Product not found");
+    const existing = await tx.product.findUniqueOrThrow({ where: { id } });
+    // Publication is not an inventory event. In particular, do not manufacture
+    // a historical opening movement for a legacy product from today's balance.
+    return tx.product.update({
       where: { id },
       data: { status, publishedAt: status === "PUBLISHED" ? (existing.publishedAt ?? new Date()) : null, archivedAt: status === "ARCHIVED" ? new Date() : null },
     });
-    if (status === "PUBLISHED" && existing.status !== "PUBLISHED") {
-      for (const variant of existing.variants) {
-        if (variant.stock <= 0) continue;
-        const alreadyRecorded = await tx.stockMovement.count({ where: { variantId: variant.id, type: "PURCHASE" } });
-        if (alreadyRecorded) continue;
-        await tx.stockMovement.create({
-          data: {
-            productId: id, variantId: variant.id, type: "PURCHASE", quantity: variant.stock,
-            balanceAfter: variant.stock, reason: "Initial stock on publish", createdById: actorId ?? null,
-          },
-        });
-      }
-    }
-    return updated;
   });
   await audit({ actorId, action: "SET_PRODUCT_STATUS", entity: "Product", entityId: id, after: { status } });
   return product;

@@ -1,8 +1,28 @@
 import type { Prisma, StockMovementType } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
 import { ConflictError, NotFoundError } from "@/lib/errors";
+import { exactVariantQuantities } from "@/lib/inventory-invariants";
 
 type Tx = Prisma.TransactionClient;
+
+/** Fail closed for legacy/imported orders without a complete, consistent recorded sale. */
+export async function hasRecordedOrderSale(
+  tx: Tx, orderId: string, productId: string, items: Array<{ variantId: string | null; quantity: number }>,
+) {
+  const movements = await tx.stockMovement.findMany({
+    where: { reference: orderId, type: "SALE" },
+    select: { productId: true, variantId: true, quantity: true, variant: { select: { productId: true } } },
+  });
+  return movements.every((movement) => movement.productId === productId && movement.variant?.productId === productId)
+    && exactVariantQuantities(items, movements.map((movement) => ({ ...movement, quantity: -movement.quantity })));
+}
+
+/** Any other stock activity tied to an order is ambiguous outside the return workflow. */
+export async function hasOtherOrderStockMovement(tx: Tx, orderId: string) {
+  return Boolean(await tx.stockMovement.findFirst({
+    where: { reference: orderId, type: { not: "SALE" } }, select: { id: true },
+  }));
+}
 
 export async function adjustStock(
   tx: Tx,
@@ -45,13 +65,29 @@ export async function adjustStock(
   return balanceAfter;
 }
 
-export async function setStock(variantId: string, stock: number, expectedStock: number, reason: string, actorId?: string) {
+export async function setStock(
+  variantId: string, stock: number, expectedStock: number, expectedMovementCount: number, reason: string, actorId?: string,
+) {
   if (![stock, expectedStock].every((value) => Number.isInteger(value) && value >= 0 && value <= 2_147_483_647)) {
     throw new ConflictError("Stock must be a non-negative integer");
   }
+  if (!Number.isSafeInteger(expectedMovementCount) || expectedMovementCount < 0) {
+    throw new ConflictError("A valid stock movement snapshot is required");
+  }
   return prisma.$transaction(async (tx) => {
+    // Every cooperating stock writer updates this row before recording its
+    // movement. Lock it before comparing both the balance and ledger count;
+    // balance alone cannot detect a sale and restoration that net to zero.
+    const locked = await tx.$queryRaw<Array<{ id: string }>>`
+      SELECT "id" FROM "ProductVariant" WHERE "id" = ${variantId} FOR UPDATE
+    `;
+    if (!locked.length) throw new NotFoundError("Variant not found");
     const variant = await tx.productVariant.findUnique({ where: { id: variantId } });
     if (!variant) throw new NotFoundError("Variant not found");
+    const movementCount = await tx.stockMovement.count({ where: { variantId } });
+    if (variant.stock !== expectedStock || movementCount !== expectedMovementCount) {
+      throw new ConflictError("Stock changed. Reload inventory and try again");
+    }
     const result = await tx.productVariant.updateMany({ where: { id: variantId, stock: expectedStock }, data: { stock } });
     if (result.count !== 1) throw new ConflictError("Stock changed. Reload inventory and try again");
     if (stock !== expectedStock) {

@@ -28,8 +28,14 @@ export type PaymentInitResult = {
 
 export type PaymentVerification = {
   status: "PAID" | "FAILED" | "PENDING";
+  // These values must come from the provider's verified response, not the
+  // callback request. Missing data is deliberately represented as absent.
   reference: string;
   amount?: number;
+  currency?: string;
+  // A failed attempt is not necessarily a closed checkout session. Only a
+  // provider-backed terminal-session check may set this flag to true.
+  terminalFailureVerified?: boolean;
   raw: Record<string, unknown>;
 };
 

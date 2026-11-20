@@ -1,3 +1,5 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 import { getPaymentConfigurations } from "@/lib/settings";
 import { Alert, Badge, Card, PageHeader, ToggleRow } from "@/components/ui";
@@ -7,6 +9,8 @@ import { formatDate } from "@/lib/utils";
 export const dynamic = "force-dynamic";
 
 export default async function PaymentsPage({ searchParams }: { searchParams: Promise<{ error?: string; success?: string }> }) {
+  await requirePageAccess(PERMISSIONS.PAYMENT_SETTINGS);
+  await requirePageAccess(PERMISSIONS.ORDER_VIEW);
   const params = await searchParams;
   const configs = await getPaymentConfigurations();
   const transactions = await prisma.paymentTransaction.findMany({ include: { order: { select: { orderNumber: true } } }, orderBy: { createdAt: "desc" }, take: 20 });

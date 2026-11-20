@@ -1,3 +1,5 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 import { getBusinessSettings } from "@/lib/settings";
 import { businessSettingsAction } from "@/app/actions/settings";
@@ -5,6 +7,7 @@ import { createRedirectAction, deleteRedirectAction } from "@/app/actions/pages"
 import { Alert, Card, Field, PageHeader } from "@/components/ui";
 
 export default async function BusinessSettingsPage({ searchParams }: { searchParams: Promise<{ error?: string; success?: string }> }) {
+  await requirePageAccess(PERMISSIONS.SETTINGS_VIEW);
   const params = await searchParams;
   const [settings, redirects] = await Promise.all([getBusinessSettings(), prisma.redirect.findMany({ orderBy: { fromPath: "asc" } })]);
   const social = settings.socialLinks as Record<string, string>;

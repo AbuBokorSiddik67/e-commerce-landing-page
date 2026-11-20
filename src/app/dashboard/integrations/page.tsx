@@ -1,3 +1,5 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 import { integrationAction } from "@/app/actions/settings";
 import { Alert, Card, PageHeader, ToggleRow } from "@/components/ui";
@@ -9,6 +11,7 @@ const forms = [
 ];
 
 export default async function IntegrationsPage({ searchParams }: { searchParams: Promise<{ error?: string; success?: string }> }) {
+  await requirePageAccess(PERMISSIONS.MARKETING_SETTINGS);
   const params = await searchParams;
   const integrations = await prisma.integration.findMany();
   return (

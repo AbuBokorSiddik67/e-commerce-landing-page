@@ -1,3 +1,5 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
 import { PageBuilder } from "@/components/dashboard/PageBuilder";
@@ -8,6 +10,7 @@ import { normalizePageSeo, normalizePageSettings, pageSettingsSchema, seoSchema 
 export default async function BuilderPage({ params, searchParams }: {
   params: Promise<{ id: string }>; searchParams: Promise<{ error?: string; success?: string }>;
 }) {
+  await requirePageAccess(PERMISSIONS.PAGE_VIEW);
   const { id } = await params;
   const query = await searchParams;
   const [page, templates] = await Promise.all([

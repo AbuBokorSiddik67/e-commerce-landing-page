@@ -1,3 +1,5 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 import { deleteMediaAction } from "@/app/actions/products";
 import { uploadMediaAction } from "@/app/actions/catalog";
@@ -6,6 +8,7 @@ import { Alert, EmptyState, PageHeader, Pagination } from "@/components/ui";
 import { formatDate } from "@/lib/utils";
 
 export default async function MediaPage({ searchParams }: { searchParams: Promise<{ page?: string; search?: string; folder?: string; error?: string; success?: string }> }) {
+  await requirePageAccess(PERMISSIONS.MEDIA_WRITE);
   const params = await searchParams;
   const result = await listMedia({ page: Number(params.page ?? 1), search: params.search, folder: params.folder });
   const folders = await prisma.mediaAsset.groupBy({ by: ["folder"], _count: { folder: true } });

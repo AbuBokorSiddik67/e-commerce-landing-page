@@ -111,9 +111,9 @@ describe("product form serialization", () => {
       status: "DRAFT", isFeatured: false, videoUrl: null, weightGrams: null,
       attributes: ["Size"], specifications: [], images: [],
       variants: [
-        { id: "v1", name: "Small", sku: null, price: null, stock: 3, lowStockThreshold: 1, imageUrl: null, attributes: [{ name: "Size", value: "S" }], expectedAttributes: [{ name: "Size", value: "S" }], updatedAt: new Date("2025-01-01T00:00:00.000Z"), isActive: true },
-        { id: "v2", name: "Medium", sku: null, price: null, stock: 4, lowStockThreshold: 1, imageUrl: null, attributes: [{ name: "Size", value: "M" }], expectedAttributes: [{ name: "Size", value: "M" }], updatedAt: new Date("2025-01-01T00:00:00.000Z"), isActive: true },
-        { id: "v3", name: "Large", sku: null, price: null, stock: 5, lowStockThreshold: 1, imageUrl: null, attributes: [{ name: "Size", value: "L" }], expectedAttributes: [{ name: "Size", value: "L" }], updatedAt: new Date("2025-01-01T00:00:00.000Z"), isActive: false },
+        { id: "v1", name: "Small", sku: null, price: null, stock: 3, lowStockThreshold: 1, imageUrl: null, attributes: [{ name: "Size", value: "S" }], expectedAttributes: [{ name: "Size", value: "S" }], expectedMovementCount: 1, updatedAt: new Date("2025-01-01T00:00:00.000Z"), isActive: true },
+        { id: "v2", name: "Medium", sku: null, price: null, stock: 4, lowStockThreshold: 1, imageUrl: null, attributes: [{ name: "Size", value: "M" }], expectedAttributes: [{ name: "Size", value: "M" }], expectedMovementCount: 2, updatedAt: new Date("2025-01-01T00:00:00.000Z"), isActive: true },
+        { id: "v3", name: "Large", sku: null, price: null, stock: 5, lowStockThreshold: 1, imageUrl: null, attributes: [{ name: "Size", value: "L" }], expectedAttributes: [{ name: "Size", value: "L" }], expectedMovementCount: 3, updatedAt: new Date("2025-01-01T00:00:00.000Z"), isActive: false },
       ],
     }} />);
     expect(screen.getAllByLabelText("Attribute value").map((input) => (input as HTMLTextAreaElement).value)).toEqual(["S", "M", "L"]);
@@ -125,9 +125,9 @@ describe("product form serialization", () => {
     fireEvent.change(large.getAllByLabelText(/^Attribute name/)[1], { target: { value: "Color" } });
     fireEvent.change(large.getAllByLabelText("Attribute value")[1], { target: { value: "Navy" } });
     expect(jsonField(formData(container), "variants")).toEqual([
-      expect.objectContaining({ id: "v1", expectedStock: 3, attributes: [{ name: "Size", value: "S" }] }),
-      expect.objectContaining({ id: "v2", expectedStock: 4, attributes: [{ name: "Size", value: "M" }], isActive: false }),
-      expect.objectContaining({ id: "v3", expectedStock: 5, attributes: [{ name: "Size", value: "XL" }, { name: "Color", value: "Navy" }], isActive: false }),
+      expect.objectContaining({ id: "v1", expectedStock: 3, expectedMovementCount: 1, attributes: [{ name: "Size", value: "S" }] }),
+      expect.objectContaining({ id: "v2", expectedStock: 4, expectedMovementCount: 2, attributes: [{ name: "Size", value: "M" }], isActive: false }),
+      expect.objectContaining({ id: "v3", expectedStock: 5, expectedMovementCount: 3, attributes: [{ name: "Size", value: "XL" }, { name: "Color", value: "Navy" }], isActive: false }),
     ]);
   });
 });

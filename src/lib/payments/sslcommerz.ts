@@ -81,9 +81,10 @@ export const sslcommerzProvider: PaymentProvider = {
     });
     const valid = ["VALID", "VALIDATED"].includes(result.status ?? "");
     return {
-      status: valid ? "PAID" : "FAILED",
-      reference: result.tran_id ?? reference,
-      amount: result.amount ? Number(result.amount) : undefined,
+      status: valid ? "PAID" : result.status === "FAILED" ? "FAILED" : "PENDING",
+      reference: result.tran_id ?? "",
+      amount: result.amount !== undefined ? Number(result.amount) : undefined,
+      currency: result.currency,
       raw: result,
     };
   },

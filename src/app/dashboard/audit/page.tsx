@@ -1,3 +1,5 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 import { formatDate } from "@/lib/utils";
 import { Card, PageHeader } from "@/components/ui";
@@ -5,6 +7,7 @@ import { Card, PageHeader } from "@/components/ui";
 export const dynamic = "force-dynamic";
 
 export default async function AuditPage({ searchParams }: { searchParams: Promise<{ page?: string }> }) {
+  await requirePageAccess(PERMISSIONS.AUDIT_VIEW);
   const params = await searchParams;
   const page = Math.max(1, Number(params.page ?? 1));
   const [logs, total] = await Promise.all([

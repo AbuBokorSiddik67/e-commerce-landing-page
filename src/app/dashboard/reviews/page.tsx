@@ -1,9 +1,12 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 import { Alert, Badge, Card, PageHeader } from "@/components/ui";
 import { moderateReviewAction } from "@/app/actions/catalog";
 import { formatDate } from "@/lib/utils";
 
 export default async function ReviewsPage({ searchParams }: { searchParams: Promise<{ error?: string; success?: string }> }) {
+  await requirePageAccess(PERMISSIONS.REVIEW_MODERATE);
   const params = await searchParams;
   const reviews = await prisma.productReview.findMany({ include: { product: { select: { name: true } } }, orderBy: { createdAt: "desc" }, take: 100 });
   return (

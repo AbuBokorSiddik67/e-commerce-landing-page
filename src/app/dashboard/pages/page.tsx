@@ -1,3 +1,5 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import Link from "next/link";
 import { prisma } from "@/lib/prisma";
 import { listPages } from "@/services/pages";
@@ -6,6 +8,7 @@ import { createPageAction } from "@/app/actions/pages";
 import { formatDate } from "@/lib/utils";
 
 export default async function PagesPage({ searchParams }: { searchParams: Promise<{ page?: string; search?: string; error?: string; success?: string }> }) {
+  await requirePageAccess(PERMISSIONS.PAGE_VIEW);
   const params = await searchParams;
   const [result, products] = await Promise.all([
     listPages({ page: Number(params.page ?? 1), search: params.search }),

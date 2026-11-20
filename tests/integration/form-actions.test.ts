@@ -114,9 +114,11 @@ describe("product form action and persistence", () => {
     const movement = await prisma.stockMovement.create({
       data: { productId: product.id, variantId: product.variants[0].id, type: "PURCHASE", quantity: 10, balanceAfter: 10 },
     });
+    const movementCounts = await Promise.all(product.variants.map((variant) =>
+      prisma.stockMovement.count({ where: { variantId: variant.id } })));
     const updatedVariants = variants.map((variant, index) => ({
       ...variant, id: product.variants[index].id,
-      expectedStock: product.variants[index].stock,
+      expectedStock: product.variants[index].stock, expectedMovementCount: movementCounts[index],
       expectedUpdatedAt: product.variants[index].updatedAt.toISOString(),
       expectedAttributes: product.variants[index].attributes,
       attributes: index === 1 ? [{ name: "Size", value: "M" }, { name: "Color", value: "Green" }] : variant.attributes,
@@ -124,6 +126,7 @@ describe("product form action and persistence", () => {
     }));
     const update = productForm(updatedVariants);
     update.set("id", product.id);
+    update.set("expectedStatus", product.status);
     update.set("name", "Updated shirt");
     // isFeatured is absent, as it is when a native checkbox is unchecked.
     expect((await submit(saveProductAction, update)).searchParams.get("success")).toBe("Product updated");

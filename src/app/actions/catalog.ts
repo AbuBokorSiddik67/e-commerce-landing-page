@@ -52,16 +52,17 @@ export async function recordRefundAction(formData: FormData) {
   const user = await requirePermission(PERMISSIONS.REFUND_WRITE);
   await finish(`/dashboard/orders/${str(formData, "orderId")}`, () => recordRefund({
     orderId: str(formData, "orderId"), amount: num(formData, "amount"), reason: str(formData, "reason"),
-    transactionId: optionalStr(formData, "transactionId") ?? undefined,
+    transactionId: optionalStr(formData, "transactionId") ?? undefined, idempotencyKey: str(formData, "idempotencyKey"),
   }, user.id), "Internal refund recorded (provider not contacted)");
 }
 
 export async function providerRefundAction(formData: FormData) {
   const user = await requirePermission(PERMISSIONS.REFUND_WRITE);
   const orderId = str(formData, "orderId");
-  await finish(`/dashboard/orders/${orderId}`, () => executeProviderRefund(
-    str(formData, "transactionId"), num(formData, "amount"), str(formData, "reason"), user.id,
-  ), "Provider refund requested — check recorded status");
+  await finish(`/dashboard/orders/${orderId}`, () => executeProviderRefund({
+    orderId, transactionId: str(formData, "transactionId"), amount: num(formData, "amount"),
+    reason: str(formData, "reason"), idempotencyKey: str(formData, "idempotencyKey"),
+  }, user.id), "Provider refund requires reconciliation; do not retry with a new key");
 }
 
 export async function customerAction(formData: FormData) {

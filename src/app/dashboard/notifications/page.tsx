@@ -1,3 +1,5 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 import { getSetting } from "@/lib/settings";
 import { markNotificationsReadAction, notificationChannelAction } from "@/app/actions/settings";
@@ -7,6 +9,7 @@ import { Badge, Card, PageHeader, ToggleRow } from "@/components/ui";
 export const dynamic = "force-dynamic";
 
 export default async function NotificationsPage() {
+  await requirePageAccess(PERMISSIONS.NOTIFICATION_VIEW);
   const [notifications, logs, inapp, email, sms] = await Promise.all([
     prisma.notification.findMany({ orderBy: { createdAt: "desc" }, take: 50 }),
     prisma.notificationLog.findMany({ orderBy: { createdAt: "desc" }, take: 30 }),

@@ -80,6 +80,8 @@ describe("Scenario D — no courier API", () => {
     const product = await createProduct();
     const { order } = await placeOrder(checkout(product.id, product.variants[0].id, "cod"));
     await expect(bookCourierShipment(order.id, "pathao", actorId)).rejects.toThrow(/disabled/);
+    await updateOrderStatus(order.id, "CONFIRMED", actorId);
+    await updateOrderStatus(order.id, "READY_TO_SHIP", actorId);
 
     const shipment = await assignManualCourier({
       orderId: order.id, courierName: "Local Delivery", trackingId: "MANUAL-123",
@@ -109,28 +111,36 @@ describe("Scenario E/F — provider behaviour", () => {
     await expect(bookCourierShipment(order.id, "steadfast", actorId)).rejects.toThrow(/credentials/);
   });
 
-  it("never leaves a paid-looking order after a provider failure; stock is restored", async () => {
+  it("retains stock for reconciliation after an ambiguous provider initialization failure", async () => {
     await setPayment("bkash", { enabled: true, visible: true, credentials: bkashCredentials });
     const product = await createProduct({ stock: 4 });
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("provider offline")));
     await expect(placeOrder(checkout(product.id, product.variants[0].id, "bkash"))).rejects.toThrow(/Payment could not be started/);
 
     const order = await prisma.order.findFirstOrThrow({ where: { productId: product.id } });
-    expect(order.status).toBe("CANCELLED");
+    expect(order.status).toBe("PENDING");
     expect(order.paymentStatus).toBe("PENDING");
-    expect((await prisma.productVariant.findUniqueOrThrow({ where: { id: product.variants[0].id } })).stock).toBe(4);
-    expect(await prisma.stockMovement.count({ where: { type: "CANCELLATION" } })).toBe(1);
+    expect((await prisma.productVariant.findUniqueOrThrow({ where: { id: product.variants[0].id } })).stock).toBe(3);
+    expect(await prisma.stockMovement.count({ where: { type: "CANCELLATION" } })).toBe(0);
+    expect((await prisma.paymentAttempt.findFirstOrThrow({ where: { orderId: order.id } })).status).toBe("INITIALIZATION_UNKNOWN");
+    expect((await prisma.stockReservation.findFirstOrThrow({ where: { orderId: order.id } })).releasedAt).toBeNull();
   });
 
   it("verifies callbacks server-side and processes the same verification only once", async () => {
     await setPayment("sslcommerz", { enabled: true, visible: true, credentials: { storeId: "store", storePassword: "pass" } });
     const product = await createProduct({ stock: 4 });
     const { order } = await placeOrder(checkout(product.id, product.variants[0].id, "cod"));
+    // Construct the already-initialized online state explicitly; this test is
+    // about callback verification, not the provider's initiation contract.
+    await prisma.order.update({ where: { id: order.id }, data: { paymentMethod: "sslcommerz", paymentStatus: "PENDING" } });
+    await prisma.stockReservation.create({ data: { orderId: order.id, variantId: product.variants[0].id,
+      quantity: 1, expiresAt: new Date(Date.now() + 30 * 60 * 1000) } });
+    await prisma.paymentAttempt.create({ data: { orderId: order.id, provider: "sslcommerz", status: "INITIATED" } });
     const transaction = await prisma.paymentTransaction.create({
-      data: { orderId: order.id, provider: "sslcommerz", reference: "tran-verify", amount: order.total, status: "INITIATED" },
+      data: { orderId: order.id, provider: "sslcommerz", reference: "tran-verify", amount: order.total, currency: order.currency, status: "INITIATED" },
     });
     vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => new Response(JSON.stringify({
-      status: "VALIDATED", tran_id: "tran-verify", amount: String(order.total),
+      status: "VALIDATED", tran_id: "tran-verify", amount: String(order.total), currency: order.currency,
     }), { status: 200 })));
 
     const first = await processPaymentCallback("sslcommerz", { val_id: "val-1", tran_id: "tran-verify" });
@@ -139,7 +149,7 @@ describe("Scenario E/F — provider behaviour", () => {
     expect(second.duplicate).toBe(true);
     const updated = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
     expect(updated.paymentStatus).toBe("PAID");
-    expect(updated.financialStatus).toBe("SETTLED");
+    expect(updated.financialStatus).toBe("PARTIALLY_SETTLED");
     expect(updated.status).toBe("CONFIRMED");
     expect((await prisma.paymentTransaction.findUniqueOrThrow({ where: { id: transaction.id } })).status).toBe("PAID");
     expect(await prisma.webhookEvent.count({ where: { provider: "sslcommerz" } })).toBe(1);

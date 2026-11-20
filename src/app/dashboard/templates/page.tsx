@@ -1,8 +1,11 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 import { Card, PageHeader } from "@/components/ui";
 import { TEMPLATES, SECTION_LABELS } from "@/lib/page-sections";
 
 export default async function TemplatesPage() {
+  await requirePageAccess(PERMISSIONS.TEMPLATE_WRITE);
   const templates = await prisma.landingPageTemplate.findMany({ where: { isActive: true }, orderBy: { name: "asc" } });
   return (
     <>

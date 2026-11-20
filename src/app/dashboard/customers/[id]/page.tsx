@@ -1,3 +1,5 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import { notFound } from "next/navigation";
 import { getCustomer } from "@/services/customers";
 import { formatDate, formatMoney, maskPhone } from "@/lib/utils";
@@ -5,6 +7,8 @@ import { Badge, Card, PageHeader } from "@/components/ui";
 import { customerAction } from "@/app/actions/catalog";
 
 export default async function CustomerDetail({ params, searchParams }: { params: Promise<{ id: string }>; searchParams: Promise<{ success?: string; error?: string }> }) {
+  await requirePageAccess(PERMISSIONS.CUSTOMER_VIEW);
+  await requirePageAccess(PERMISSIONS.ORDER_VIEW);
   const { id } = await params;
   const query = await searchParams;
   const customer = await getCustomer(id).catch(() => null);
