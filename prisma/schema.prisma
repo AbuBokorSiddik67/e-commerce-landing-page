@@ -316,7 +316,7 @@ model ProductVariant {
   stock            Int              @default(0)
   lowStockThreshold Int             @default(5)
   imageUrl         String?
-  attributes       Json             @default("{}")
+  attributes       Json             @default("[]")
   isActive         Boolean          @default(true)
   position         Int              @default(0)
   orderItems       OrderItem[]

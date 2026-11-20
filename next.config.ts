@@ -1,8 +1,12 @@
 import type { NextConfig } from "next";
 
+// The sandbox preview is embedded cross-origin. Keep clickjacking protection
+// enabled everywhere else, including production, unless explicitly in dev preview.
+const allowPreviewEmbedding = process.env.NODE_ENV === "development" && process.env.LANDIQ_PREVIEW_EMBED === "1";
+
 const securityHeaders = [
   { key: "X-DNS-Prefetch-Control", value: "off" },
-  { key: "X-Frame-Options", value: "SAMEORIGIN" },
+  ...(allowPreviewEmbedding ? [] : [{ key: "X-Frame-Options", value: "SAMEORIGIN" }]),
   { key: "X-Content-Type-Options", value: "nosniff" },
   { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
   { key: "Permissions-Policy", value: "camera=(), microphone=(), geolocation=()" },

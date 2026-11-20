@@ -130,9 +130,9 @@ async function main() {
         ],
         variants: {
           create: [
-            { name: "Small / Black", sku: "TSHIRT-S-BLK", stock: 25, lowStockThreshold: 5, attributes: { Size: "S", Color: "Black" }, position: 0 },
-            { name: "Medium / Black", sku: "TSHIRT-M-BLK", stock: 25, lowStockThreshold: 5, attributes: { Size: "M", Color: "Black" }, position: 1 },
-            { name: "Large / Black", sku: "TSHIRT-L-BLK", stock: 15, lowStockThreshold: 5, attributes: { Size: "L", Color: "Black" }, position: 2 },
+            { name: "Small / Black", sku: "TSHIRT-S-BLK", stock: 25, lowStockThreshold: 5, attributes: [{ name: "Size", value: "S" }, { name: "Color", value: "Black" }], position: 0 },
+            { name: "Medium / Black", sku: "TSHIRT-M-BLK", stock: 25, lowStockThreshold: 5, attributes: [{ name: "Size", value: "M" }, { name: "Color", value: "Black" }], position: 1 },
+            { name: "Large / Black", sku: "TSHIRT-L-BLK", stock: 15, lowStockThreshold: 5, attributes: [{ name: "Size", value: "L" }, { name: "Color", value: "Black" }], position: 2 },
           ],
         },
       },

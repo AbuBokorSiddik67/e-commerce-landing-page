@@ -3,6 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { PageBuilder } from "@/components/dashboard/PageBuilder";
 import { Alert, PageHeader } from "@/components/ui";
 import type { SectionData, SectionType } from "@/lib/page-sections";
+import { normalizePageSeo, normalizePageSettings, pageSettingsSchema, seoSchema } from "@/lib/page-config";
 
 export default async function BuilderPage({ params, searchParams }: {
   params: Promise<{ id: string }>; searchParams: Promise<{ error?: string; success?: string }>;
@@ -21,8 +22,9 @@ export default async function BuilderPage({ params, searchParams }: {
       <PageBuilder
         page={{
           id: page.id, slug: page.slug, title: page.title, status: page.status, templateCode: page.templateCode,
-          theme: (page.theme ?? {}) as Record<string, string>, seo: (page.seo ?? {}) as Record<string, unknown>,
-          settings: (page.settings ?? {}) as Record<string, unknown>, noIndex: page.noIndex,
+          theme: (page.theme ?? {}) as Record<string, string>,
+          seo: seoSchema.parse(normalizePageSeo(page.seo)),
+          settings: pageSettingsSchema.parse(normalizePageSettings(page.settings)), noIndex: page.noIndex,
           scheduledFor: page.scheduledFor?.toISOString() ?? null,
           product: { name: page.product.name, slug: page.product.slug, regularPrice: page.product.regularPrice, salePrice: page.product.salePrice, images: page.product.images.map((i) => ({ url: i.url, alt: i.alt })) },
         }}

@@ -9,8 +9,8 @@ export function LoginForm() {
   return (
     <form action={action} className="space-y-4">
       {state?.error && <div className="alert-error" role="alert">{state.error}</div>}
-      <Field label="Email address" name="email" required><input className="input" type="email" name="email" autoComplete="username" required /></Field>
-      <Field label="Password" name="password" required><input className="input" type="password" name="password" autoComplete="current-password" required /></Field>
+      <Field label="Email address" name="email" required><input id="email" className="input" type="email" name="email" autoComplete="username" required /></Field>
+      <Field label="Password" name="password" required><input id="password" className="input" type="password" name="password" autoComplete="current-password" required /></Field>
       <Button disabled={pending} className="w-full">{pending ? "Signing in…" : "Sign in"}</Button>
       <p className="text-center text-sm text-ink-500"><Link href="/forgot-password" className="font-semibold text-brand-700 hover:underline">Forgot password?</Link></p>
     </form>

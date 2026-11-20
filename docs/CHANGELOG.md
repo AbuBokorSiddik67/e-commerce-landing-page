@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased — form validation fixes
+
+- Standardized variant attributes as arrays of name/value pairs and added a data/default migration for legacy object-shaped attributes.
+- Kept builder SEO and page-option checkboxes as booleans, with shared pre-validation handling of recognized legacy boolean strings.
+- Reject malformed JSON and unsupported checkbox values instead of silently replacing them with defaults.
+- Added form, action, persistence, migration and browser regression tests; associated login labels with their controls for accessible browser interaction.
+
 ## 1.0.0 — initial implementation
 
 - Added Next.js App Router TypeScript strict codebase, Tailwind design system and dashboard shell.

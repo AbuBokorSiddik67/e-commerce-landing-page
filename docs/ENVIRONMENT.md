@@ -28,4 +28,6 @@ Provider credentials can be entered in the dashboard instead of environment vari
 
 `scripts/dev-db.ts` uses `PG_PORT=55432` by default and writes its cluster to `.postgres-data/` (Git-ignored). Test configuration is in `tests/setup.ts` and `vitest.config.ts`.
 
+For a cross-origin embedded development preview only, set `LANDIQ_PREVIEW_EMBED=1` when starting `next dev`. This omits the `X-Frame-Options` header for that preview; leave it unset for normal development. Production retains the header even if the flag is set.
+
 Prisma engine downloads in this sandbox required a local mirror via `PRISMA_ENGINES_MIRROR`; normal installations can omit it and use the official Prisma download endpoint.
