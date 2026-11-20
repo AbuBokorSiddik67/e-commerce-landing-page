@@ -8,6 +8,20 @@ import { createProduct, deleteProduct, duplicateProduct, productSchema, setProdu
 import { setStock } from "@/services/inventory";
 import { bool, finish, jsonField, num, optionalStr, str } from "./helpers";
 
+function optionalCategory(formData: FormData, key: string) {
+  const value = formData.get(key);
+  if (value === null) return undefined;
+  if (typeof value !== "string") throw new Error(`${key} must be text`);
+  return value.trim() || null;
+}
+
+function optionalJson(formData: FormData, key: string): unknown {
+  const value = formData.get(key);
+  if (value === null) return undefined;
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${key} must be JSON text`);
+  return jsonField<unknown>(formData, key, undefined);
+}
+
 function productInput(formData: FormData) {
   return productSchema.parse({
     name: str(formData, "name"),
@@ -17,12 +31,13 @@ function productInput(formData: FormData) {
     description: optionalStr(formData, "description"),
     regularPrice: str(formData, "regularPrice"),
     salePrice: optionalStr(formData, "salePrice"),
-    categoryId: optionalStr(formData, "categoryId"),
+    categoryId: optionalCategory(formData, "categoryId"),
+    expectedCategoryId: optionalCategory(formData, "expectedCategoryId"),
     status: str(formData, "status", "DRAFT"),
     isFeatured: bool(formData, "isFeatured"),
     videoUrl: optionalStr(formData, "videoUrl"),
     weightGrams: optionalStr(formData, "weightGrams"),
-    dimensions: jsonField<unknown>(formData, "dimensions", null),
+    dimensions: optionalJson(formData, "dimensions"),
     attributes: jsonField<unknown>(formData, "attributes", []),
     specifications: jsonField<unknown>(formData, "specifications", []),
     images: jsonField<unknown>(formData, "images", []),
@@ -35,6 +50,10 @@ export async function saveProductAction(formData: FormData) {
   const id = str(formData, "id");
   await finish("/dashboard/products", async () => {
     const input = productInput(formData);
+    const changesStock = input.variants.some((variant) => variant.id
+      ? variant.expectedStock !== undefined && variant.stock !== variant.expectedStock
+      : variant.stock !== 0);
+    if (changesStock) await requirePermission(PERMISSIONS.INVENTORY_WRITE);
     if (id) await updateProduct(id, input, user.id);
     else {
       const product = await createProduct(input, user.id);
@@ -85,15 +104,33 @@ export async function deleteCategoryAction(formData: FormData) {
   await requirePermission(PERMISSIONS.CATEGORY_WRITE);
   await finish("/dashboard/categories", async () => {
     const id = str(formData, "id");
-    const count = await prisma.product.count({ where: { categoryId: id } });
-    if (count) throw new ConflictError("Move products out of this category before deleting it");
-    await prisma.category.delete({ where: { id } });
+    await prisma.$transaction(async (tx) => {
+      // Serialize the count and delete against new assignments, which take a
+      // share lock on this same category inside their product transaction.
+      await tx.$queryRaw`SELECT "id" FROM "Category" WHERE "id" = ${id} FOR UPDATE`;
+      const count = await tx.product.count({ where: { categoryId: id } });
+      if (count) throw new ConflictError("Move products out of this category before deleting it");
+      await tx.category.delete({ where: { id } });
+    });
   }, "Category deleted");
+}
+
+function requiredStock(formData: FormData, key: string) {
+  const raw = formData.get(key);
+  if (typeof raw !== "string" || !raw.trim()) throw new ConflictError(`${key} is required`);
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 0 || value > 2_147_483_647) {
+    throw new ConflictError(`${key} must be a non-negative whole number`);
+  }
+  return value;
 }
 
 export async function setStockAction(formData: FormData) {
   const user = await requirePermission(PERMISSIONS.INVENTORY_WRITE);
-  await finish("/dashboard/inventory", () => setStock(str(formData, "variantId"), num(formData, "stock"), str(formData, "reason", "Manual adjustment"), user.id), "Stock adjusted");
+  await finish("/dashboard/inventory", () => setStock(
+    str(formData, "variantId"), requiredStock(formData, "stock"), requiredStock(formData, "expectedStock"),
+    str(formData, "reason", "Manual adjustment"), user.id,
+  ), "Stock adjusted");
 }
 
 export async function deleteMediaAction(formData: FormData) {

@@ -1,25 +1,68 @@
 "use client";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import Link from "next/link";
 import { Plus, Trash2 } from "lucide-react";
 import { saveProductAction } from "@/app/actions/products";
 import { Button, Card, Field } from "@/components/ui";
 import type { VariantAttribute } from "@/lib/product-attributes";
 
+type AttributeRow = VariantAttribute & { uiKey: string };
 type Variant = {
-  id?: string; name: string; sku: string; price: string; stock: number;
-  lowStockThreshold: number; imageUrl: string; attributes: VariantAttribute[]; attributesText: string; isActive: boolean;
+  uiKey: string; id?: string; name: string; sku: string; price: string; stock: string;
+  expectedStock?: number; expectedUpdatedAt?: string; expectedAttributes?: unknown;
+  lowStockThreshold: number; imageUrl: string; attributes: AttributeRow[]; isActive: boolean;
 };
 type Image = { url: string; alt: string; kind: "IMAGE" | "VIDEO" };
 type Spec = { name: string; value: string };
 
-const emptyVariant = (): Variant => ({ name: "Default", sku: "", price: "", stock: 0, lowStockThreshold: 5, imageUrl: "", attributes: [], attributesText: "", isActive: true });
+const emptyVariant = (uiKey: string): Variant => ({ uiKey, name: "Default", sku: "", price: "", stock: "0", lowStockThreshold: 5, imageUrl: "", attributes: [], isActive: true });
 
-function parseAttributesText(text: string): VariantAttribute[] {
-  return text.split(",").map((part) => part.trim()).filter(Boolean).map((part) => {
-    const [name, ...value] = part.split(":");
-    return { name: name.trim(), value: value.join(":").trim() };
-  });
+// Textareas normalize CR and CRLF to LF in their DOM value. Match unchanged
+// characters across the edit so their original line endings survive, even
+// when a single paste changes text on both sides of a newline.
+function mergeTextareaValue(original: string, edited: string) {
+  if (!original.includes("\r")) return edited;
+  let normalized = "";
+  const boundaries = [0];
+  for (let index = 0; index < original.length; index++) {
+    if (original[index] === "\r") {
+      if (original[index + 1] === "\n") index++;
+      normalized += "\n";
+    } else {
+      normalized += original[index];
+    }
+    boundaries.push(index + 1);
+  }
+  // Matching line breaks is more important than matching surrounding letters:
+  // a paste may replace both sides while leaving the visible newline unchanged.
+  const newlineWeight = normalized.length + edited.length + 1;
+  const scores = Array.from({ length: normalized.length + 1 }, () => new Uint32Array(edited.length + 1));
+  for (let i = normalized.length - 1; i >= 0; i--) {
+    for (let j = edited.length - 1; j >= 0; j--) {
+      const match = normalized[i] === edited[j]
+        ? scores[i + 1][j + 1] + (normalized[i] === "\n" ? newlineWeight : 1)
+        : 0;
+      scores[i][j] = Math.max(scores[i + 1][j], scores[i][j + 1], match);
+    }
+  }
+  let i = 0;
+  let j = 0;
+  let merged = "";
+  while (i < normalized.length && j < edited.length) {
+    const match = normalized[i] === edited[j]
+      ? scores[i + 1][j + 1] + (normalized[i] === "\n" ? newlineWeight : 1)
+      : -1;
+    if (scores[i][j] === match) {
+      merged += original.slice(boundaries[i], boundaries[i + 1]);
+      i++;
+      j++;
+    } else if (scores[i + 1][j] >= scores[i][j + 1]) {
+      i++;
+    } else {
+      merged += edited[j++];
+    }
+  }
+  return merged + edited.slice(j);
 }
 
 export function ProductForm({ product, categories }: {
@@ -29,31 +72,65 @@ export function ProductForm({ product, categories }: {
     status: string; isFeatured: boolean; videoUrl: string | null; weightGrams: number | null;
     attributes: string[]; specifications: unknown;
     images: Array<{ url: string; alt: string | null; kind: string }>;
-    variants: Array<{ id: string; name: string; sku: string | null; price: number | null; stock: number; lowStockThreshold: number; imageUrl: string | null; attributes: VariantAttribute[]; isActive: boolean }>;
+    variants: Array<{ id: string; name: string; sku: string | null; price: number | null; stock: number; lowStockThreshold: number; imageUrl: string | null; attributes: VariantAttribute[]; expectedAttributes: unknown; updatedAt: Date | string; isActive: boolean }>;
   };
-  categories: Array<{ id: string; name: string }>;
+  categories: Array<{ id: string; name: string; isActive?: boolean }>;
 }) {
-  const [variants, setVariants] = useState<Variant[]>(product?.variants.map((v) => ({
-    id: v.id, name: v.name, sku: v.sku ?? "", price: v.price == null ? "" : String(v.price), stock: v.stock,
-    lowStockThreshold: v.lowStockThreshold, imageUrl: v.imageUrl ?? "", attributes: v.attributes,
-    attributesText: v.attributes.map((a) => `${a.name}: ${a.value}`).join(", "), isActive: v.isActive,
-  })) ?? [emptyVariant()]);
+  const nextUiKey = useRef(0);
+  const [variants, setVariants] = useState<Variant[]>(() => product?.variants.map((v) => ({
+    uiKey: `existing-${v.id}`, id: v.id, name: v.name, sku: v.sku ?? "", price: v.price == null ? "" : String(v.price), stock: String(v.stock),
+    expectedStock: v.stock, expectedUpdatedAt: new Date(v.updatedAt).toISOString(), expectedAttributes: v.expectedAttributes,
+    lowStockThreshold: v.lowStockThreshold, imageUrl: v.imageUrl ?? "",
+    attributes: v.attributes.map((attribute, index) => ({ ...attribute, uiKey: `initial-${index}` })), isActive: v.isActive,
+  })) ?? [emptyVariant("initial-new")]);
   const [images, setImages] = useState<Image[]>(product?.images.map((i) => ({ url: i.url, alt: i.alt ?? "", kind: i.kind === "VIDEO" ? "VIDEO" : "IMAGE" })) ?? []);
   const [specs, setSpecs] = useState<Spec[]>((product?.specifications as Spec[] | undefined) ?? []);
   const [attributes, setAttributes] = useState<string[]>(product?.attributes ?? []);
 
-  function updateVariant(index: number, patch: Partial<Variant>) {
-    setVariants((current) => current.map((v, i) => (i === index ? { ...v, ...patch } : v)));
+  function localKey() {
+    return `local-${nextUiKey.current++}`;
+  }
+
+  function updateVariant(key: string, patch: Partial<Variant>) {
+    setVariants((current) => current.map((v) => (v.uiKey === key ? { ...v, ...patch } : v)));
+  }
+
+  function addVariant() {
+    const uiKey = localKey();
+    setVariants((current) => [...current, emptyVariant(uiKey)]);
+  }
+
+  function addAttribute(variantKey: string) {
+    const uiKey = localKey();
+    setVariants((current) => current.map((v) => v.uiKey === variantKey && v.attributes.length < 10
+      ? { ...v, attributes: [...v.attributes, { uiKey, name: "", value: "" }] }
+      : v));
+  }
+
+  function updateAttribute(variantKey: string, attributeKey: string, field: "name" | "value", edited: string) {
+    setVariants((current) => current.map((v) => v.uiKey === variantKey
+      ? { ...v, attributes: v.attributes.map((attribute) => attribute.uiKey === attributeKey
+        ? { ...attribute, [field]: mergeTextareaValue(attribute[field], edited) }
+        : attribute) }
+      : v));
+  }
+
+  function removeAttribute(variantKey: string, attributeKey: string) {
+    setVariants((current) => current.map((v) => v.uiKey === variantKey
+      ? { ...v, attributes: v.attributes.filter((attribute) => attribute.uiKey !== attributeKey) }
+      : v));
   }
 
   return (
     <form action={saveProductAction} className="grid gap-6 lg:grid-cols-[1fr_340px]">
       <input type="hidden" name="id" value={product?.id ?? ""} />
+      {product && <input type="hidden" name="expectedCategoryId" value={product.categoryId ?? ""} />}
       <input type="hidden" name="variants" value={JSON.stringify(variants.map((v) => ({
-        ...(v.id ? { id: v.id } : {}), name: v.name, sku: v.sku || null,
-        price: v.price === "" ? null : Number(v.price), stock: Number(v.stock),
+        ...(v.id ? { id: v.id, expectedStock: v.expectedStock, expectedUpdatedAt: v.expectedUpdatedAt, expectedAttributes: v.expectedAttributes } : {}),
+        name: v.name, sku: v.sku || null,
+        price: v.price === "" ? null : Number(v.price), stock: v.stock === "" ? null : Number(v.stock),
         lowStockThreshold: Number(v.lowStockThreshold), imageUrl: v.imageUrl || null,
-        attributes: v.attributes, isActive: v.isActive, position: 0,
+        attributes: v.attributes.map(({ name, value }) => ({ name, value })), isActive: v.isActive, position: 0,
       })))} />
       <input type="hidden" name="images" value={JSON.stringify(images.filter((i) => i.url))} />
       <input type="hidden" name="specifications" value={JSON.stringify(specs)} />
@@ -66,27 +143,41 @@ export function ProductForm({ product, categories }: {
             <Field label="Product name" name="name" required><input id="name" className="input" name="name" defaultValue={product?.name} required /></Field>
             <Field label="URL slug" name="slug" hint="Lowercase letters, numbers and hyphens"><input className="input" name="slug" defaultValue={product?.slug} placeholder="auto-generated" /></Field>
             <Field label="SKU" name="sku"><input className="input" name="sku" defaultValue={product?.sku ?? ""} /></Field>
-            <Field label="Category" name="categoryId"><select className="input" name="categoryId" defaultValue={product?.categoryId ?? ""}><option value="">Uncategorised</option>{categories.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></Field>
+            <Field label="Category" name="categoryId"><select id="categoryId" className="input" name="categoryId" defaultValue={product?.categoryId ?? ""}><option value="">Uncategorised</option>{categories.map((c) => <option key={c.id} value={c.id}>{c.name}{c.isActive === false ? " (inactive — current)" : ""}</option>)}{product?.categoryId && !categories.some((c) => c.id === product.categoryId) && <option value={product.categoryId}>Current category (unavailable)</option>}</select></Field>
           </div>
           <div className="mt-4"><Field label="Short description" name="shortDescription"><textarea className="textarea" name="shortDescription" defaultValue={product?.shortDescription ?? ""} /></Field></div>
           <div className="mt-4"><Field label="Full description" name="description"><textarea className="textarea min-h-[160px]" name="description" defaultValue={product?.description ?? ""} /></Field></div>
         </Card>
 
         <Card className="p-6">
-          <div className="flex items-center justify-between"><h2 className="font-semibold">Variants & stock</h2><button type="button" className="btn-secondary" onClick={() => setVariants((v) => [...v, emptyVariant()])}><Plus size={16} />Add variant</button></div>
-          <p className="mt-1 text-xs text-ink-500">Each variant has its own price, SKU, stock and attributes (e.g. Size: M, Color: Black).</p>
+          <div className="flex items-center justify-between"><h2 className="font-semibold">Variants & stock</h2><button type="button" className="btn-secondary" onClick={addVariant}><Plus size={16} />Add variant</button></div>
+          <p className="mt-1 text-xs text-ink-500">Each variant has its own price, SKU, stock and attributes. Existing variants can be deactivated to preserve order and inventory history.</p>
           <div className="mt-4 space-y-4">
-            {variants.map((variant, index) => <div key={variant.id ?? `new-${index}`} className="rounded-xl border border-ink-100 bg-ink-50/40 p-4">
+            {variants.map((variant, index) => <div key={variant.uiKey} className="rounded-xl border border-ink-100 bg-ink-50/40 p-4">
               <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-                <Field label="Variant name" name={`v-name-${index}`}><input id={`v-name-${index}`} className="input" value={variant.name} onChange={(e) => updateVariant(index, { name: e.target.value })} required /></Field>
-                <Field label="SKU" name={`v-sku-${index}`}><input className="input" value={variant.sku} onChange={(e) => updateVariant(index, { sku: e.target.value })} /></Field>
-                <Field label="Price (BDT)" name={`v-price-${index}`} hint="Blank uses product price"><input className="input" type="number" min={0} value={variant.price} onChange={(e) => updateVariant(index, { price: e.target.value })} /></Field>
-                <Field label="Stock" name={`v-stock-${index}`}><input className="input" type="number" min={0} value={variant.stock} onChange={(e) => updateVariant(index, { stock: Number(e.target.value) })} /></Field>
-                <Field label="Low stock alert at" name={`v-threshold-${index}`}><input className="input" type="number" min={0} value={variant.lowStockThreshold} onChange={(e) => updateVariant(index, { lowStockThreshold: Number(e.target.value) })} /></Field>
-                <Field label="Variant image URL" name={`v-image-${index}`}><input className="input" value={variant.imageUrl} onChange={(e) => updateVariant(index, { imageUrl: e.target.value })} /></Field>
-                <div className="sm:col-span-2"><Field label="Attributes" name={`v-attrs-${index}`} hint="Comma-separated, e.g. Size: M, Color: Black"><input id={`v-attrs-${index}`} className="input" value={variant.attributesText} onChange={(e) => updateVariant(index, { attributesText: e.target.value, attributes: parseAttributesText(e.target.value) })} /></Field></div>
+                <Field label="Variant name" name={`v-name-${index}`}><input id={`v-name-${index}`} className="input" value={variant.name} onChange={(e) => updateVariant(variant.uiKey, { name: e.target.value })} required /></Field>
+                <Field label="SKU" name={`v-sku-${index}`}><input className="input" value={variant.sku} onChange={(e) => updateVariant(variant.uiKey, { sku: e.target.value })} /></Field>
+                <Field label="Price (BDT)" name={`v-price-${index}`} hint="Blank uses product price"><input className="input" type="number" min={0} value={variant.price} onChange={(e) => updateVariant(variant.uiKey, { price: e.target.value })} /></Field>
+                <Field label="Stock" name={`v-stock-${index}`}><input className="input" type="number" min={0} max={2147483647} step={1} value={variant.stock} onChange={(e) => updateVariant(variant.uiKey, { stock: e.target.value })} required /></Field>
+                <Field label="Low stock alert at" name={`v-threshold-${index}`}><input className="input" type="number" min={0} value={variant.lowStockThreshold} onChange={(e) => updateVariant(variant.uiKey, { lowStockThreshold: Number(e.target.value) })} /></Field>
+                <Field label="Variant image URL" name={`v-image-${index}`}><input className="input" value={variant.imageUrl} onChange={(e) => updateVariant(variant.uiKey, { imageUrl: e.target.value })} /></Field>
+                <fieldset className="rounded-lg border border-ink-100 p-3 sm:col-span-2 lg:col-span-4" aria-label={`Attributes for ${variant.name}`}>
+                  <legend className="px-1 text-xs font-semibold text-ink-600">Attributes</legend>
+                  <p className="mb-3 text-xs text-ink-500">Names and values are saved exactly as entered.</p>
+                  <div className="space-y-3">
+                    {variant.attributes.map((attribute, attributeIndex) => {
+                      const prefix = `v-${variant.uiKey}-attribute-${attribute.uiKey}`;
+                      return <div key={attribute.uiKey} className="grid items-end gap-3 sm:grid-cols-[1fr_1fr_auto]">
+                        <Field label="Attribute name" name={`${prefix}-name`} required><textarea id={`${prefix}-name`} className="textarea min-h-[42px] resize-y" rows={1} maxLength={80} value={attribute.name} onChange={(e) => updateAttribute(variant.uiKey, attribute.uiKey, "name", e.target.value)} required /></Field>
+                        <Field label="Attribute value" name={`${prefix}-value`}><textarea id={`${prefix}-value`} className="textarea min-h-[42px] resize-y" rows={1} maxLength={120} value={attribute.value} onChange={(e) => updateAttribute(variant.uiKey, attribute.uiKey, "value", e.target.value)} /></Field>
+                        <button type="button" className="btn-ghost text-red-600" aria-label={`Remove attribute ${attributeIndex + 1} from ${variant.name}`} onClick={() => removeAttribute(variant.uiKey, attribute.uiKey)}><Trash2 size={16} />Remove</button>
+                      </div>;
+                    })}
+                  </div>
+                  <button type="button" className="btn-secondary mt-3" aria-label={`Add attribute to ${variant.name}`} disabled={variant.attributes.length >= 10} onClick={() => addAttribute(variant.uiKey)}><Plus size={16} />Add attribute</button>
+                </fieldset>
               </div>
-              <div className="mt-3 flex items-center justify-between"><label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={variant.isActive} onChange={(e) => updateVariant(index, { isActive: e.target.checked })} />Active</label>{variants.length > 1 && <button type="button" className="text-xs font-semibold text-red-600" onClick={() => setVariants((v) => v.filter((_, i) => i !== index))}><Trash2 size={14} className="inline" /> Remove</button>}</div>
+              <div className="mt-3 flex items-center justify-between"><label className="flex items-center gap-2 text-xs"><input type="checkbox" checked={variant.isActive} onChange={(e) => updateVariant(variant.uiKey, { isActive: e.target.checked })} />Active</label>{!variant.id && variants.length > 1 && <button type="button" className="text-xs font-semibold text-red-600" aria-label={`Remove new variant ${variant.name}`} onClick={() => setVariants((current) => current.filter((v) => v.uiKey !== variant.uiKey))}><Trash2 size={14} className="inline" /> Remove</button>}</div>
             </div>)}
           </div>
         </Card>

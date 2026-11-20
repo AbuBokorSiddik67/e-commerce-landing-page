@@ -22,10 +22,15 @@ test("product variants and builder checkboxes survive real form submissions", as
     await page.getByRole("button", { name: "Add variant" }).click();
     await page.getByRole("button", { name: "Add variant" }).click();
     const names = page.locator('input[id^="v-name-"]');
-    const attributes = page.locator('input[id^="v-attrs-"]');
     for (const [index, size] of ["S", "M", "L"].entries()) {
       await names.nth(index).fill(`Size ${size}`);
-      await attributes.nth(index).fill(`Size: ${size}, Color: Black`);
+      const attributes = page.getByRole("group", { name: `Attributes for Size ${size}` });
+      await attributes.getByRole("button", { name: `Add attribute to Size ${size}` }).click();
+      await attributes.getByLabel("Attribute name").fill("Size");
+      await attributes.getByLabel("Attribute value").fill(size);
+      await attributes.getByRole("button", { name: `Add attribute to Size ${size}` }).click();
+      await attributes.getByLabel("Attribute name").nth(1).fill("Color");
+      await attributes.getByLabel("Attribute value").nth(1).fill("Black");
     }
     await page.getByLabel("Feature this product").check();
     await page.getByRole("button", { name: "Create product" }).click();
@@ -41,8 +46,10 @@ test("product variants and builder checkboxes survive real form submissions", as
     if (!created.landingPage) throw new Error("Product did not receive a landing page");
 
     await page.getByRole("link", { name, exact: true }).click();
-    await expect(page.locator('input[id^="v-attrs-"]').nth(1)).toHaveValue("Size: M, Color: Black");
-    await page.locator('input[id^="v-attrs-"]').nth(1).fill("Size: M, Color: Green");
+    const medium = page.getByRole("group", { name: "Attributes for Size M" });
+    await expect(medium.getByLabel("Attribute name").nth(0)).toHaveValue("Size");
+    await expect(medium.getByLabel("Attribute value").nth(1)).toHaveValue("Black");
+    await medium.getByLabel("Attribute value").nth(1).fill("Green");
     await page.getByLabel("Feature this product").uncheck();
     await page.getByRole("button", { name: "Save changes" }).click();
     await expect(page.getByRole("status")).toHaveText("Product updated");

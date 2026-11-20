@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ProductForm } from "@/components/dashboard/ProductForm";
 import { PageBuilder } from "@/components/dashboard/PageBuilder";
@@ -32,12 +32,17 @@ describe("product form serialization", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add variant" }));
 
     const names = screen.getAllByLabelText("Variant name");
-    const attributes = screen.getAllByLabelText(/^Attributes/);
     ["Small", "Medium", "Large"].forEach((name, index) => {
       fireEvent.change(names[index], { target: { value: name } });
     });
-    ["Size: S, Color: Black", "Size: M, Color: Blue", "Size: L, Color: Red"].forEach((value, index) => {
-      fireEvent.change(attributes[index], { target: { value } });
+    [["Small", "S", "Black"], ["Medium", "M", "Blue"], ["Large", "L", "Red"]].forEach(([variant, size, color]) => {
+      const group = within(screen.getByRole("group", { name: `Attributes for ${variant}` }));
+      fireEvent.click(group.getByRole("button", { name: `Add attribute to ${variant}` }));
+      fireEvent.change(group.getByLabelText(/^Attribute name/), { target: { value: "Size" } });
+      fireEvent.change(group.getByLabelText("Attribute value"), { target: { value: size } });
+      fireEvent.click(group.getByRole("button", { name: `Add attribute to ${variant}` }));
+      fireEvent.change(group.getAllByLabelText(/^Attribute name/)[1], { target: { value: "Color" } });
+      fireEvent.change(group.getAllByLabelText("Attribute value")[1], { target: { value: color } });
     });
     fireEvent.click(screen.getAllByLabelText("Active")[1]);
     fireEvent.click(screen.getByLabelText("Feature this product"));
@@ -52,33 +57,77 @@ describe("product form serialization", () => {
     fireEvent.click(screen.getByLabelText("Feature this product"));
     expect(formData(container).has("isFeatured")).toBe(false);
 
-    fireEvent.click(screen.getAllByRole("button", { name: /Remove/ })[1]);
-    expect(screen.getAllByLabelText(/^Attributes/).map((input) => (input as HTMLInputElement).value)).toEqual(["Size: S, Color: Black", "Size: L, Color: Red"]);
+    const largeName = within(screen.getByRole("group", { name: "Attributes for Large" })).getAllByLabelText(/^Attribute name/)[0];
+    fireEvent.click(screen.getByRole("button", { name: "Remove new variant Medium" }));
+    expect(within(screen.getByRole("group", { name: "Attributes for Large" })).getAllByLabelText(/^Attribute name/)[0]).toBe(largeName);
+    expect(screen.queryByRole("group", { name: "Attributes for Medium" })).not.toBeInTheDocument();
     expect(jsonField(formData(container), "variants")).toEqual([
       expect.objectContaining({ name: "Small", attributes: [{ name: "Size", value: "S" }, { name: "Color", value: "Black" }] }),
       expect.objectContaining({ name: "Large", attributes: [{ name: "Size", value: "L" }, { name: "Color", value: "Red" }] }),
     ]);
   });
 
-  it("loads existing attribute arrays and keeps the displayed data aligned after removing a variant", () => {
+  it("adds, edits and removes individual rows without parsing punctuation or losing whitespace", () => {
+    const { container } = render(<ProductForm categories={[]} />);
+    const group = within(screen.getByRole("group", { name: "Attributes for Default" }));
+    fireEvent.click(group.getByRole("button", { name: "Add attribute to Default" }));
+    fireEvent.change(group.getByLabelText(/^Attribute name/), { target: { value: " Size,: \t" } });
+    fireEvent.change(group.getByLabelText("Attribute value"), { target: { value: " M, tall: \n " } });
+    fireEvent.click(group.getByRole("button", { name: "Add attribute to Default" }));
+    const retainedName = group.getAllByLabelText(/^Attribute name/)[1];
+    fireEvent.change(retainedName, { target: { value: " Color: " } });
+    fireEvent.change(group.getAllByLabelText("Attribute value")[1], { target: { value: "Navy, blue" } });
+    expect(jsonField(formData(container), "variants")).toEqual([
+      expect.objectContaining({ attributes: [{ name: " Size,: \t", value: " M, tall: \n " }, { name: " Color: ", value: "Navy, blue" }] }),
+    ]);
+    fireEvent.click(group.getByRole("button", { name: "Remove attribute 1 from Default" }));
+    expect(group.getByLabelText(/^Attribute name/)).toBe(retainedName);
+    expect(jsonField(formData(container), "variants")).toEqual([
+      expect.objectContaining({ attributes: [{ name: " Color: ", value: "Navy, blue" }] }),
+    ]);
+    fireEvent.click(group.getByRole("button", { name: "Remove attribute 1 from Default" }));
+    expect(jsonField(formData(container), "variants")).toEqual([expect.objectContaining({ attributes: [] })]);
+  });
+
+  it("preserves empty values, exposes required names, and prevents adding more than ten rows", () => {
+    const { container } = render(<ProductForm categories={[]} />);
+    const group = within(screen.getByRole("group", { name: "Attributes for Default" }));
+    for (let index = 0; index < 10; index++) {
+      fireEvent.click(group.getByRole("button", { name: "Add attribute to Default" }));
+      fireEvent.change(group.getAllByLabelText(/^Attribute name/)[index], { target: { value: `Name ${index}` } });
+    }
+    expect(group.getByRole("button", { name: "Add attribute to Default" })).toBeDisabled();
+    expect(group.getAllByLabelText(/^Attribute name/)[0]).toBeRequired();
+    expect(group.getAllByLabelText("Attribute value")[0]).not.toBeRequired();
+    expect(jsonField(formData(container), "variants")).toEqual([
+      expect.objectContaining({ attributes: Array.from({ length: 10 }, (_, index) => ({ name: `Name ${index}`, value: "" })) }),
+    ]);
+  });
+
+  it("keeps existing variants and allows deactivation without dropping their IDs", () => {
     const { container } = render(<ProductForm categories={[]} product={{
       id: "product-1", name: "Shirt", slug: "shirt", sku: null, shortDescription: null,
       description: null, regularPrice: 500, salePrice: null, categoryId: null,
       status: "DRAFT", isFeatured: false, videoUrl: null, weightGrams: null,
       attributes: ["Size"], specifications: [], images: [],
       variants: [
-        { id: "v1", name: "Small", sku: null, price: null, stock: 3, lowStockThreshold: 1, imageUrl: null, attributes: [{ name: "Size", value: "S" }], isActive: true },
-        { id: "v2", name: "Medium", sku: null, price: null, stock: 4, lowStockThreshold: 1, imageUrl: null, attributes: [{ name: "Size", value: "M" }], isActive: true },
-        { id: "v3", name: "Large", sku: null, price: null, stock: 5, lowStockThreshold: 1, imageUrl: null, attributes: [{ name: "Size", value: "L" }], isActive: false },
+        { id: "v1", name: "Small", sku: null, price: null, stock: 3, lowStockThreshold: 1, imageUrl: null, attributes: [{ name: "Size", value: "S" }], expectedAttributes: [{ name: "Size", value: "S" }], updatedAt: new Date("2025-01-01T00:00:00.000Z"), isActive: true },
+        { id: "v2", name: "Medium", sku: null, price: null, stock: 4, lowStockThreshold: 1, imageUrl: null, attributes: [{ name: "Size", value: "M" }], expectedAttributes: [{ name: "Size", value: "M" }], updatedAt: new Date("2025-01-01T00:00:00.000Z"), isActive: true },
+        { id: "v3", name: "Large", sku: null, price: null, stock: 5, lowStockThreshold: 1, imageUrl: null, attributes: [{ name: "Size", value: "L" }], expectedAttributes: [{ name: "Size", value: "L" }], updatedAt: new Date("2025-01-01T00:00:00.000Z"), isActive: false },
       ],
     }} />);
-    expect(screen.getAllByLabelText(/^Attributes/).map((input) => (input as HTMLInputElement).value)).toEqual(["Size: S", "Size: M", "Size: L"]);
-    fireEvent.click(screen.getAllByRole("button", { name: /Remove/ })[1]);
-    expect(screen.getAllByLabelText(/^Attributes/).map((input) => (input as HTMLInputElement).value)).toEqual(["Size: S", "Size: L"]);
-    fireEvent.change(screen.getAllByLabelText(/^Attributes/)[1], { target: { value: "Size: XL, Color: Navy" } });
+    expect(screen.getAllByLabelText("Attribute value").map((input) => (input as HTMLTextAreaElement).value)).toEqual(["S", "M", "L"]);
+    expect(screen.queryByRole("button", { name: /Remove new variant/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getAllByLabelText("Active")[1]);
+    const large = within(screen.getByRole("group", { name: "Attributes for Large" }));
+    fireEvent.change(large.getByLabelText("Attribute value"), { target: { value: "XL" } });
+    fireEvent.click(large.getByRole("button", { name: "Add attribute to Large" }));
+    fireEvent.change(large.getAllByLabelText(/^Attribute name/)[1], { target: { value: "Color" } });
+    fireEvent.change(large.getAllByLabelText("Attribute value")[1], { target: { value: "Navy" } });
     expect(jsonField(formData(container), "variants")).toEqual([
-      expect.objectContaining({ id: "v1", attributes: [{ name: "Size", value: "S" }] }),
-      expect.objectContaining({ id: "v3", attributes: [{ name: "Size", value: "XL" }, { name: "Color", value: "Navy" }], isActive: false }),
+      expect.objectContaining({ id: "v1", expectedStock: 3, attributes: [{ name: "Size", value: "S" }] }),
+      expect.objectContaining({ id: "v2", expectedStock: 4, attributes: [{ name: "Size", value: "M" }], isActive: false }),
+      expect.objectContaining({ id: "v3", expectedStock: 5, attributes: [{ name: "Size", value: "XL" }, { name: "Color", value: "Navy" }], isActive: false }),
     ]);
   });
 });

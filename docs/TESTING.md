@@ -2,15 +2,25 @@
 
 ## Commands and verified results
 
+For the product-preservation changes, the focused unit/component/mocked-service run passed 122 tests, the opt-in disposable PostgreSQL fixture passed 10 tests, and typecheck, lint and production build passed. The full database-backed integration and Playwright suites were not rerun for this change.
+
+Some integration suites use `tests/helpers.ts`, whose reset helper truncates public tables. Never point them at an existing or unidentified database, and do not run them when a database reset is not expressly permitted.
+
+### Product preservation checks
+
+The focused unit, component and mocked-service checks can be run without a database:
+
 ```bash
-npm run typecheck   # passed
-npm run lint        # passed, no warnings/errors
-npm test            # 49 tests passed (12 files)
-npm run build       # production build passed
-npm run test:e2e    # 4 Playwright tests passed with Chromium
+npx vitest run tests/unit tests/components tests/integration/product-attributes-compatibility.test.ts tests/integration/order-attribute-compatibility.test.ts
 ```
 
-Tests use Vitest, React Testing Library, jsdom and a real temporary PostgreSQL database (`landiq_test`), not mocked repositories for core workflows. Run `npx tsx scripts/dev-db.ts` and apply migrations to `landiq_test` before running integration tests.
+A separate opt-in suite creates a fresh embedded PostgreSQL cluster in a unique `tmp/phase11-postgres-*` directory, checks its directory, port and user before creating a partial test-only schema, and removes only that newly created cluster on exit:
+
+```bash
+LANDIQ_DISPOSABLE_PG_TEST=1 npx vitest run tests/integration/product-disposable-postgres.test.tsx
+```
+
+This suite ignores `DATABASE_URL`, does not run migrations or `db push`, and never invokes the reset helper. It tests actual PostgreSQL transactions and selected foreign keys, but its partial fixture is not the full deployed schema and is not a replacement for migration or full application end-to-end testing. It requires a working Prisma query engine and embedded PostgreSQL support on the host.
 
 ## Covered workflows
 
@@ -35,7 +45,7 @@ Tests use Vitest, React Testing Library, jsdom and a real temporary PostgreSQL d
 
 ## Playwright
 
-The Playwright suite covers owner login, a customer COD order, invalid tracking, and creating/updating product variants and builder checkboxes through the browser. All four tests passed against a seeded local PostgreSQL database and a production server. The form regression test removes its own uniquely named product afterwards; use a dedicated test database for the suite, since the COD test creates an order.
+The Playwright suite covers owner login, a customer COD order, invalid tracking, and creating/updating product variants and builder checkboxes through the browser. All four tests passed in an earlier run against a seeded local PostgreSQL database and a production server; the updated form test was not rerun for these product-preservation changes. The form regression test removes its own uniquely named product afterwards; use a dedicated test database for the suite, since the COD test creates an order.
 
 The official Chromium download endpoint was blocked in this sandbox, so the run used a temporary Chromium 153 headless binary and its libraries obtained from npm. In a normal environment, install the Playwright-managed browser with `npx playwright install chromium`, seed the test database, and run `npm run test:e2e`.
 
