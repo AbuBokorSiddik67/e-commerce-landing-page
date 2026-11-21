@@ -39,7 +39,7 @@ vi.mock("@/lib/couriers/registry", () => ({ getCourierProvider: (code: string) =
   code, credentialsValid: () => true, createShipment: mocks.createShipment, cancelShipment: mocks.cancelShipment,
 } : null }));
 
-import { bookCourierShipment, cancelOrder, finalizeCourierBooking, placeOrder, updateOrderStatus, type PendingCourierClaim } from "@/services/orders";
+import { bookCourierShipment, cancelCustomerOrder, cancelOrder, collectCod, finalizeCourierBooking, placeOrder, updateOrderStatus, type PendingCourierClaim } from "@/services/orders";
 import { recordCourierRejectionEvidence, reconcileCourierBooking, reconcileCourierCancellation, requestCourierCancellation } from "@/services/courier-operations";
 import { assignOwnDelivery, recordOwnDeliveryEvent } from "@/services/own-delivery";
 import { createProduct } from "@/services/products";
@@ -283,6 +283,48 @@ describe.skipIf(!enabled)("Phase 1 on a new identity-verified disposable Postgre
     expect(await balances(value.variantId)).toEqual({ stock: 2, damagedStock: 0 });
     expect(await db().stockMovement.count({ where: { reference: value.order.id, type: "CANCELLATION" } })).toBe(1);
     expect((await db().order.findUniqueOrThrow({ where: { id: value.order.id } })).cancellationStockReleasedAt).not.toBeNull();
+  });
+
+  it("cancels a pending COD order once using its private tracking token", async () => {
+    const value = await sale();
+    await expect(cancelCustomerOrder("not-the-real-tracking-token")).rejects.toThrow(/not found/i);
+    const results = await Promise.all([cancelCustomerOrder(value.order.trackingToken), cancelCustomerOrder(value.order.trackingToken)]);
+    expect(results.filter((result) => result.changed)).toHaveLength(1);
+    expect(results.every((result) => result.stockReleased)).toBe(true);
+    expect((await db().order.findUniqueOrThrow({ where: { id: value.order.id } })).status).toBe("CANCELLED");
+    expect(await balances(value.variantId)).toEqual({ stock: 2, damagedStock: 0 });
+    expect(await db().stockMovement.count({ where: { reference: value.order.id, type: "CANCELLATION" } })).toBe(1);
+  });
+
+  it("does not let a customer cancel once the store has confirmed fulfillment", async () => {
+    const value = await sale();
+    await updateOrderStatus(value.order.id, "CONFIRMED", actor);
+    await expect(cancelCustomerOrder(value.order.trackingToken)).rejects.toThrow(/no longer be cancelled online/i);
+    expect((await db().order.findUniqueOrThrow({ where: { id: value.order.id } })).status).toBe("CONFIRMED");
+    expect(await balances(value.variantId)).toEqual({ stock: 1, damagedStock: 0 });
+    expect(await db().stockMovement.count({ where: { reference: value.order.id, type: "CANCELLATION" } })).toBe(0);
+  });
+
+  it("rejects customer cancellation after COD has already been collected", async () => {
+    const value = await sale();
+    await collectCod(value.order.id, value.order.total, actor);
+    await expect(cancelCustomerOrder(value.order.trackingToken)).rejects.toThrow(/no longer be cancelled online/i);
+    const order = await db().order.findUniqueOrThrow({ where: { id: value.order.id } });
+    expect(order.status).toBe("PENDING");
+    expect(order.paymentStatus).toBe("COD_COLLECTED");
+    expect(await balances(value.variantId)).toEqual({ stock: 1, damagedStock: 0 });
+    expect(await db().stockMovement.count({ where: { reference: value.order.id, type: "CANCELLATION" } })).toBe(0);
+  });
+
+  it("serializes customer cancellation against manager confirmation", async () => {
+    const value = await sale();
+    const results = await Promise.allSettled([cancelCustomerOrder(value.order.trackingToken), updateOrderStatus(value.order.id, "CONFIRMED", actor)]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    const order = await db().order.findUniqueOrThrow({ where: { id: value.order.id } });
+    expect(["CANCELLED", "CONFIRMED"]).toContain(order.status);
+    expect((await balances(value.variantId)).stock).toBe(order.status === "CANCELLED" ? 2 : 1);
+    expect(await db().stockMovement.count({ where: { reference: value.order.id, type: "CANCELLATION" } })).toBe(order.status === "CANCELLED" ? 1 : 0);
   });
 
   it("rolls back cancellation if its actor cannot be recorded", async () => {

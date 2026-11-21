@@ -11,10 +11,10 @@ It is **not** a SaaS platform. There are no subscriptions, workspaces, tenant ro
 - Session authentication, password hashing, reset flow, login history, RBAC with seven roles and server-side permission checks
 - Product/category/variant/attribute management, media library with signature validation, inventory movements and low-stock alerts
 - Section-based landing page builder (22 section types), six editable templates, drafts, versions, scheduling and publishing
-- Public `/p/[slug]` renderer with variant/quantity selection, coupons, responsive previews, SEO metadata, JSON-LD, sitemap and redirects
-- Checkout with COD as a fully independent default, plus modular SSLCommerz, bKash and Nagad adapters with server-side callback verification
+- Public `/shop` catalog and browser cart, plus `/p/[slug]` product pages with variant/quantity selection, coupons, responsive previews, SEO metadata, JSON-LD, sitemap and redirects
+- Single-product checkout (each cart item becomes a separate order) with COD, plus modular SSLCommerz, bKash and Nagad adapters with server-side callback verification
 - Courier settings with optional Pathao, Steadfast and REDX adapters and a complete manual courier workflow
-- Secure `/track/[token]` pages with masked customer details and status timelines
+- Private `/track/[token]` pages with masked customer details, status timelines and cancellation of eligible pending COD orders
 - Customers, returns, refunds, coupons, reviews, analytics and notification channels with delivery logs
 - Marketing integrations (Meta Pixel/CAPI, Google Analytics, GTM) with server-side purchase events when configured
 - Audit logs, CSP/security headers, rate limiting, encrypted provider credentials, CSRF origin checks
@@ -24,29 +24,21 @@ See [docs/IMPLEMENTATION_PROGRESS.md](docs/IMPLEMENTATION_PROGRESS.md) for verif
 
 ## Quick start
 
-Requirements: Node.js 22+, PostgreSQL 17+ (or the bundled development PostgreSQL script), npm.
+Requirements: Node.js 22+, npm, access to the official Prisma engine downloads, and a PostgreSQL database already matching the current `prisma/schema.prisma`.
+
+**Database prerequisite:** the checked-in migration history does not yet bring an existing database to the current Phase 1 schema. The proposal in `docs/proposals/PHASE_1_ORDER_INVENTORY_MIGRATION.md` needs a separate, reviewed migration and historical-data verification. Do not run a reset, `db push`, seed, or migrations against an existing database without an approved backup and migration plan. The browser test fixture is disposable and is not an installation migration.
+
+With a compatible database and the official Prisma engine available:
 
 ```bash
-npm install
-cp .env.example .env
-# Edit .env: set DATABASE_URL and a long random CREDENTIALS_ENCRYPTION_KEY
-
-npm run prisma:deploy       # apply migrations
-npm run db:seed             # create owner, roles, settings, templates and demo product
-npm run dev                 # http://localhost:3000
+npm ci
+test -f .env || cp .env.example .env
+# Edit .env: set DATABASE_URL, NEXT_PUBLIC_SITE_URL and a long random CREDENTIALS_ENCRYPTION_KEY
+npm run prisma:generate
+npm run dev                 # binds 0.0.0.0:3000
 ```
 
-Seeded demo owner: `owner@landiq.local` / `Owner@123456789`. **Change this password immediately on any real installation.**
-
-Public demo storefront: `http://localhost:3000/p/premium-cotton-t-shirt`
-
-### Optional local PostgreSQL (no system install)
-
-```bash
-npx tsx scripts/dev-db.ts   # starts embedded PostgreSQL on 127.0.0.1:55432
-```
-
-Use `postgresql://landiq:landiq_dev_password@127.0.0.1:55432/landiq?schema=public` as `DATABASE_URL`.
+Visit `/shop` to browse published products whose landing pages are published. Orders are placed separately for each cart item. Save the private confirmation/tracking link; eligible pending COD orders can be cancelled there. A new store also requires an authorized owner, enabled COD configuration, stock, and published product/landing-page records before it can accept orders.
 
 ## Common commands
 

@@ -41,25 +41,6 @@ export function maskAddress(address: string) {
   return `${address.slice(0, 6)}…, ${address.slice(-Math.min(12, address.length - 6))}`;
 }
 
-export function truncate(value: string, length = 120) {
-  return value.length > length ? `${value.slice(0, length)}…` : value;
-}
-
-export function parseJson<T>(value: unknown, fallback: T): T {
-  if (typeof value === "string") {
-    try {
-      return JSON.parse(value) as T;
-    } catch {
-      return fallback;
-    }
-  }
-  return (value ?? fallback) as T;
-}
-
-export function uniqueSlug(base: string) {
-  return `${base || "item"}-${Math.random().toString(36).slice(2, 7)}`;
-}
-
 export function daysAgo(days: number) {
   const date = new Date();
   date.setHours(0, 0, 0, 0);

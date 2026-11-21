@@ -19,7 +19,7 @@ async function main() {
   const ids = [info.financeOrderId, info.deliveryOrderId, info.courierOrderId, info.knownCourierOrderId];
   if (info.state !== "ready" || !Number.isInteger(info.webPort) || !Number.isInteger(info.pid)
     || ids.some((id) => typeof id !== "string" || !/^[a-z0-9]+$/.test(id)) || new Set(ids).size !== ids.length
-    || !info.managerEmail?.endsWith("@fixture.invalid") || !info.viewerEmail?.endsWith("@fixture.invalid")) {
+    || !info.managerEmail?.endsWith("@fixture.invalid") || !info.storeManagerEmail?.endsWith("@fixture.invalid") || !info.viewerEmail?.endsWith("@fixture.invalid")) {
     throw new Error("Invalid browser fixture metadata");
   }
   process.kill(info.pid, 0);
@@ -89,10 +89,51 @@ async function main() {
   const rejectionEvidence = "Synthetic support case confirms this exact request was rejected";
   const bookingEvidence = "Synthetic support case reports this exact shipment and references";
   try {
+    // One real store-manager flow creates a product with stock, publishes its
+    // landing, then confirms the customer checkout created by the matching smoke.
+    let page = await role(info.storeManagerEmail);
+    await page.goto("/dashboard/products/new", { waitUntil: "domcontentloaded", timeout: 90_000 });
+    await check(page.locator('form[aria-busy]')).toHaveAttribute("aria-busy", "false");
+    await page.locator('input[name="name"]').fill("Manager Browser Product");
+    await page.locator('input[name="slug"]').fill("manager-browser-product");
+    await page.locator('input[name="regularPrice"]').fill("700");
+    await page.locator('label[for="v-stock-0"] input').fill("3");
+    await check(page.locator('input[name="variants"]')).toHaveValue(/"stock":3/);
+    await page.locator('select[name="status"]').selectOption("PUBLISHED");
+    await page.getByRole("button", { name: "Create product" }).click();
+    await success(page, "Product created");
+    const productRow = page.locator("tbody tr").filter({ hasText: "Manager Browser Product" });
+    await check(productRow).toHaveCount(1);
+    await check(productRow).toContainText("PUBLISHED");
+    await check(productRow.locator("td").nth(4)).toHaveText("3");
+    await productRow.getByRole("link", { name: "Manager Browser Product" }).click();
+    await page.locator('textarea[name="shortDescription"]').fill("Synthetic manager update");
+    await page.getByRole("button", { name: "Save changes" }).click();
+    await success(page, "Product updated");
+    await page.goto("/dashboard/pages?search=Manager%20Browser%20Product", { waitUntil: "domcontentloaded", timeout: 90_000 });
+    await page.locator("tbody tr").filter({ hasText: "Manager Browser Product" }).getByRole("link", { name: "Edit" }).click();
+    await page.getByRole("button", { name: "Publish page", exact: true }).click();
+    await success(page, "Page published");
+    await page.goto("/shop", { waitUntil: "domcontentloaded", timeout: 90_000 });
+    const managerProduct = page.getByRole("link", { name: /Manager Browser Product/ });
+    await check(managerProduct).toContainText("Synthetic manager update");
+    await managerProduct.click();
+    await check(page.getByRole("heading", { name: "Manager Browser Product", level: 1 })).toBeVisible();
+    await check(page.getByRole("button", { name: /Place order/ })).toBeEnabled();
+    await page.goto("/dashboard/orders?search=Checkout%20Fixture%20Buyer", { waitUntil: "domcontentloaded", timeout: 90_000 });
+    const customerOrder = page.locator("tbody tr").filter({ hasText: "Checkout Fixture Buyer" });
+    await check(customerOrder).toHaveCount(1);
+    await customerOrder.locator('a[href^="/dashboard/orders/"]').click();
+    const statusForm = formFor(page, "Update status");
+    await statusForm.locator('select[name="status"]').selectOption("CONFIRMED");
+    await statusForm.getByRole("button", { name: "Update status" }).click();
+    await success(page, "Status updated");
+    console.info("MANAGER: product creation/update, stock, publishing, storefront and order confirmation verified");
+
     // Capture valid manager actions before the viewer attempts them. The same
     // fixture operations then succeed as manager, so failures are not merely
     // due to invalid form inputs or unmet workflow preconditions.
-    let page = await role(info.managerEmail);
+    page = await role(info.managerEmail);
     await openOrder(page, info.financeOrderId);
     const note = formFor(page, "Save note");
     await note.locator('textarea[name="internalNote"]').fill("Synthetic authorized manager note");

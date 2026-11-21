@@ -47,7 +47,15 @@ async function main() {
     assert.equal(actual.usr, config.user); assert.equal(actual.host, config.host); assert.equal(actual.port, config.port);
     assert.equal(actual.schema, "public"); assert.equal(actual.ro, "on");
     const manager = await one('SELECT id FROM "User" WHERE email=$1', [info.managerEmail]);
+    const storeManager = await one('SELECT id FROM "User" WHERE email=$1', [info.storeManagerEmail]);
     const viewer = await one('SELECT id FROM "User" WHERE email=$1', [info.viewerEmail]);
+    const managed = await one(`SELECT p."shortDescription",p."regularPrice",p.status AS productstatus,
+      v.stock,l.status AS pagestatus FROM "Product" p JOIN "ProductVariant" v ON v."productId"=p.id
+      JOIN "LandingPage" l ON l."productId"=p.id WHERE p.name=$1`, ["Manager Browser Product"]);
+    assert.deepEqual(managed, { shortDescription: "Synthetic manager update", regularPrice: 700,
+      productstatus: "PUBLISHED", stock: 3, pagestatus: "PUBLISHED" });
+    const managerOrderUpdate = await one('SELECT count(*)::int AS n FROM "OrderStatusHistory" WHERE "createdById"=$1 AND "toStatus"=$2', [storeManager.id, "CONFIRMED"]);
+    assert.equal(managerOrderUpdate.n, 1);
 
     const receipt = await one(`SELECT r.id,r."receivedQuantity",r."sellableQuantity",r."damagedQuantity",
       r."receivedById",r."inspectedById",r."inspectedAt" IS NOT NULL AS inspected,v.stock,v."damagedStock"
@@ -58,10 +66,16 @@ async function main() {
     assert.deepEqual(receiptMovements.rows, [{ bucket: "DAMAGED", quantity: 1 }, { bucket: "SELLABLE", quantity: 1 }]);
     const checkout = await one('SELECT stock,"damagedStock" FROM "ProductVariant" WHERE id=$1', [info.checkoutVariantId]);
     assert.deepEqual(checkout, { stock: 0, damagedStock: 0 });
-    const checkoutOrder = await one('SELECT id,quantity FROM "Order" WHERE "productId"=$1', [info.checkoutProductId]);
-    assert.equal(checkoutOrder.quantity, 2);
+    const checkoutOrder = await one('SELECT id,quantity,status FROM "Order" WHERE "productId"=$1', [info.checkoutProductId]);
+    assert.equal(checkoutOrder.quantity, 2); assert.equal(checkoutOrder.status, "CONFIRMED");
     const checkoutMovement = await one('SELECT quantity FROM "StockMovement" WHERE reference=$1 AND type=$2', [checkoutOrder.id, "SALE"]);
     assert.equal(checkoutMovement.quantity, -2);
+    const cancelledOrder = await one('SELECT id,status,"cancellationStockReleasedAt" IS NOT NULL AS released FROM "Order" WHERE "productId"=$1', [info.cancelProductId]);
+    assert.equal(cancelledOrder.status, "CANCELLED"); assert.equal(cancelledOrder.released, true);
+    const cancelBalance = await one('SELECT stock,"damagedStock" FROM "ProductVariant" WHERE id=$1', [info.cancelVariantId]);
+    assert.deepEqual(cancelBalance, { stock: 2, damagedStock: 0 });
+    const cancelMovements = await db.query('SELECT type,quantity FROM "StockMovement" WHERE reference=$1 ORDER BY type::text', [cancelledOrder.id]);
+    assert.deepEqual(cancelMovements.rows, [{ type: "CANCELLATION", quantity: 1 }, { type: "SALE", quantity: -1 }]);
 
     const finance = await one(`SELECT "paymentStatus","financialStatus","settlementStatus","codCollectedAt" IS NOT NULL AS collected,
       "codSettledAt" IS NOT NULL AS settled,"internalNote" FROM "Order" WHERE id=$1`, [info.financeOrderId]);

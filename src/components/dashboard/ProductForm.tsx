@@ -1,5 +1,5 @@
 "use client";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { Plus, Trash2 } from "lucide-react";
 import { saveProductAction } from "@/app/actions/products";
@@ -77,6 +77,10 @@ export function ProductForm({ product, categories }: {
   categories: Array<{ id: string; name: string; isActive?: boolean }>;
 }) {
   const nextUiKey = useRef(0);
+  // Variant edits are serialized into hidden JSON. Do not allow pre-hydration
+  // edits/submission to silently save the server-rendered default instead.
+  const [ready, setReady] = useState(false);
+  useEffect(() => setReady(true), []);
   const [variants, setVariants] = useState<Variant[]>(() => product?.variants.map((v) => ({
     uiKey: `existing-${v.id}`, id: v.id, name: v.name, sku: v.sku ?? "", price: v.price == null ? "" : String(v.price), stock: String(v.stock),
     expectedStock: v.stock, expectedMovementCount: v.expectedMovementCount,
@@ -123,7 +127,8 @@ export function ProductForm({ product, categories }: {
   }
 
   return (
-    <form action={saveProductAction} className="grid gap-6 lg:grid-cols-[1fr_340px]">
+    <form action={saveProductAction} aria-busy={!ready} className="grid gap-6 lg:grid-cols-[1fr_340px]">
+      <fieldset disabled={!ready} className="contents">
       <input type="hidden" name="id" value={product?.id ?? ""} />
       {product && <><input type="hidden" name="expectedCategoryId" value={product.categoryId ?? ""} /><input type="hidden" name="expectedStatus" value={product.status} /></>}
       <input type="hidden" name="variants" value={JSON.stringify(variants.map((v) => ({
@@ -214,6 +219,8 @@ export function ProductForm({ product, categories }: {
           <div className="mt-4 space-y-2"><Button className="w-full">{product ? "Save changes" : "Create product"}</Button><Link href="/dashboard/products" className="btn-secondary w-full">Cancel</Link></div>
         </Card>
       </div>
+      </fieldset>
+      {!ready && <p className="text-sm text-ink-500">Loading product editor…</p>}
     </form>
   );
 }

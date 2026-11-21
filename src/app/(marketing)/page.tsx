@@ -22,7 +22,7 @@ export default function HomePage() {
             <h1 className="mt-6 font-display text-5xl font-semibold leading-[1.06] tracking-tight sm:text-6xl">Your products.<br />Your pages.<br /><span className="text-brand-300">Your business.</span></h1>
             <p className="mt-6 max-w-xl text-lg leading-relaxed text-ink-200">LANDIQ turns one installation into a complete direct-to-customer store. Build focused landing pages for every product, take Cash on Delivery orders, and manage the whole business from one dashboard.</p>
             <div className="mt-8 flex flex-wrap gap-3">
-              <LinkButton href="/p/premium-cotton-t-shirt" variant="primary" className="bg-brand-500 hover:bg-brand-400">See a live storefront <ArrowRight size={16} /></LinkButton>
+              <LinkButton href="/shop" variant="primary" className="bg-brand-500 hover:bg-brand-400">Browse products <ArrowRight size={16} /></LinkButton>
               <LinkButton href="/features" variant="secondary" className="border-white/20 bg-transparent text-white hover:bg-white/10">Explore features</LinkButton>
             </div>
             <p className="mt-6 text-sm text-ink-400">No subscriptions · No mandatory gateway · No multi-tenant platform</p>

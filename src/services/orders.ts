@@ -207,7 +207,6 @@ async function placeNewOrder(input: ParsedCheckout, operation: CheckoutOperation
         createdAt: { gte: new Date(Date.now() - 15_000) } }, select: { id: true } });
       if (duplicateAfterLock) throw new ConflictError("An order was just submitted. Please wait before repeating.");
     }
-
     const created = await tx.order.create({
       data: {
         ...(operation ? { id: operation.id } : {}),
@@ -457,15 +456,25 @@ async function canReleaseCancellationStock(tx: Prisma.TransactionClient, order: 
 }
 
 async function cancelOrderLocked(
-  tx: Prisma.TransactionClient, orderId: string, actorId: string | null, reason: string, expiryBefore?: Date,
+  tx: Prisma.TransactionClient, orderId: string, actorId: string | null, reason: string, expiryBefore?: Date, customerToken?: string,
 ) {
   await lockOrder(tx, orderId);
   const order = await tx.order.findUniqueOrThrow({
     where: { id: orderId }, include: { items: true, payments: true, paymentAttempts: true, reservations: true, refunds: true },
   });
+  if (customerToken && order.trackingToken !== customerToken) throw new NotFoundError("Order not found");
   if (order.status === "CANCELLED") return { order, changed: false, stockReleased: Boolean(order.cancellationStockReleasedAt) };
   if (order.status === "RETURNED") throw new ConflictError("This order has already been fully returned");
+  // Customers can cancel only pending COD orders, and only when the same
+  // locked transaction can prove the stock release is safe. Managers retain
+  // the separate reconciliation workflow for everything else.
+  if (customerToken && (order.status !== "PENDING" || order.paymentMethod !== "cod" || order.paymentStatus !== "COD_PENDING")) {
+    throw new ConflictError("This order can no longer be cancelled online. Please contact the store.");
+  }
   const stockReleased = await canReleaseCancellationStock(tx, order);
+  if (customerToken && !stockReleased) {
+    throw new ConflictError("This order needs store review before cancellation. Please contact the store.");
+  }
   if (expiryBefore) {
     const active = order.reservations.filter((reservation) => !reservation.releasedAt);
     if (!stockReleased || order.paymentMethod === "cod" || order.status !== "PENDING" || !active.length
@@ -509,6 +518,15 @@ async function cancelOrderLocked(
     entity: "Order", entityId: orderId, before: { status: order.status },
     after: { status: "CANCELLED", reason, stockReleased, ownDeliveryRequiresReview } } });
   return { order, changed: true, stockReleased };
+}
+
+/** The tracking token is a secret capability; never accept an order ID here. */
+export async function cancelCustomerOrder(trackingToken: string) {
+  const token = z.string().min(20).max(128).regex(/^[A-Za-z0-9_-]+$/).parse(trackingToken);
+  const pointer = await prisma.order.findUnique({ where: { trackingToken: token }, select: { id: true } });
+  if (!pointer) throw new NotFoundError("Order not found");
+  const result = await prisma.$transaction((tx) => cancelOrderLocked(tx, pointer.id, null, "Cancelled by customer", undefined, token));
+  return { changed: result.changed, stockReleased: result.stockReleased };
 }
 
 export async function cancelOrder(orderId: string, actorId: string, reason: string) {
@@ -1418,7 +1436,7 @@ export async function getOrderByTrackingToken(token: string) {
     where: { trackingToken: token },
     select: {
       id: true, orderNumber: true, createdAt: true, status: true, total: true,
-      paymentMethod: true, deliveryOption: true, expectedDeliveryAt: true, district: true, area: true,
+      paymentMethod: true, paymentStatus: true, deliveryOption: true, expectedDeliveryAt: true, district: true, area: true,
       items: { select: { name: true, quantity: true } },
       product: { select: { name: true, slug: true, images: { take: 1, orderBy: { position: "asc" } } } },
       statusHistory: {

@@ -16,6 +16,7 @@ async function main() {
   const info = JSON.parse(fs.readFileSync(infoFile, "utf8"));
   if (info.state !== "ready" || !Number.isInteger(info.webPort) || !Number.isInteger(info.pid)
     || !/^browser-checkout-[0-9a-f-]+$/.test(info.checkoutSlug ?? "") || !info.checkoutProductId
+    || !/^browser-cancel-[0-9a-f-]+$/.test(info.cancelSlug ?? "") || !info.cancelProductId
     || !info.managerEmail?.endsWith("@fixture.invalid")) throw new Error("Invalid browser fixture metadata");
   process.kill(info.pid, 0);
   const origin = `http://127.0.0.1:${info.webPort}`;
@@ -41,7 +42,25 @@ async function main() {
       await page.getByLabel(/District/).fill("Rajshahi");
       await page.getByLabel(/Quantity/).fill("2");
     };
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90_000 });
+    await page.goto("/shop", { waitUntil: "domcontentloaded", timeout: 90_000 });
+    await check(page.getByRole("heading", { name: "Browse products" })).toBeVisible();
+    await page.getByRole("link", { name: /Browser Cancellation Item/ }).click();
+    await check(page.getByRole("heading", { name: "Browser Cancellation Item", level: 1 })).toBeVisible();
+    await check(page.getByRole("button", { name: /Place order/ })).toBeEnabled();
+    await page.getByRole("button", { name: "Add to cart" }).click();
+    await check(page.getByRole("status")).toHaveText("Added to cart.");
+    await page.goto("/shop", { waitUntil: "domcontentloaded", timeout: 90_000 });
+    await page.getByRole("link", { name: /Checkout Browser Item/ }).click();
+    await check(page.getByRole("button", { name: /Place order/ })).toBeEnabled();
+    await page.getByLabel(/Quantity/).fill("2");
+    await page.getByRole("button", { name: "Add to cart" }).click();
+    await check(page.getByRole("status")).toHaveText("Added to cart.");
+    await page.goto("/cart", { waitUntil: "domcontentloaded", timeout: 90_000 });
+    const checkoutCartItem = page.locator(".surface").filter({ hasText: "Checkout Browser Item" });
+    await check(checkoutCartItem).toContainText("Quantity 2");
+    await check(page.locator(".surface").filter({ hasText: "Browser Cancellation Item" })).toHaveCount(1);
+    await checkoutCartItem.getByRole("link", { name: "Checkout" }).click();
+    await check(page.getByLabel(/Quantity/)).toHaveValue("2");
     await check(page.getByRole("button", { name: /Place order/ })).toBeEnabled();
     // Compile the development endpoint with an invalid synthetic request
     // before filling the form, so Fast Refresh cannot discard an in-flight UI.
@@ -78,7 +97,7 @@ async function main() {
 
     await page.reload({ waitUntil: "domcontentloaded", timeout: 90_000 });
     await check(page.getByText(/retry in this tab/)).toBeVisible();
-    await check(page.locator('select[name="variant"] option')).toContainText("out of stock");
+    await check(page.locator('select[name="variant"] option').filter({ hasText: "out of stock" })).toHaveCount(1);
     await check(page.getByLabel(/Quantity/)).not.toHaveAttribute("readonly", "");
 
     // A holder of the key must still present the identical checkout details.
@@ -109,6 +128,14 @@ async function main() {
     expect(retryBody.orderNumber).toBe(firstResponse.body.orderNumber);
     expect(retryBody.trackingToken).toBe(firstResponse.body.trackingToken);
     await check(page.getByRole("heading", { name: "Thank you for your order" })).toBeVisible();
+    await check(page.getByText(firstResponse.body.orderNumber, { exact: true })).toBeVisible();
+    // An order number and spoofed payment flag alone must not disclose details.
+    await page.goto(`/order-confirmed?order=${encodeURIComponent(firstResponse.body.orderNumber)}&payment=verified`, { waitUntil: "domcontentloaded", timeout: 90_000 });
+    await check(page.getByRole("heading", { name: "Order confirmation unavailable" })).toBeVisible();
+    await check(page.getByText(firstResponse.body.orderNumber, { exact: true })).toHaveCount(0);
+    await page.goto("/cart", { waitUntil: "domcontentloaded", timeout: 90_000 });
+    await check(page.locator(".surface").filter({ hasText: "Checkout Browser Item" })).toHaveCount(0);
+    await check(page.locator(".surface").filter({ hasText: "Browser Cancellation Item" })).toHaveCount(1);
 
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 90_000 });
     await check(page.getByText(/retry in this tab/)).toBeVisible();
@@ -118,7 +145,34 @@ async function main() {
     expect(replacement.submitted).toBe(false);
     expect(replacement.key).not.toBe(saved.key);
     await check(page.getByRole("button", { name: /Place order/ })).toBeDisabled();
-    console.info("Public COD: lost committed response, reload, sold-out two-unit retry, capability checks and explicit new order verified");
+    console.info("Public COD: catalog/cart, lost committed response, reload, sold-out retry, private confirmation and explicit new order verified");
+
+    // Checkout the remaining cart item as a separate order, then cancel it
+    // through its private tracking link. The fallback page has no sections.
+    await page.goto("/cart", { waitUntil: "domcontentloaded", timeout: 90_000 });
+    await page.locator(".surface").filter({ hasText: "Browser Cancellation Item" }).getByRole("link", { name: "Checkout" }).click();
+    await check(page.getByRole("heading", { name: "Browser Cancellation Item", level: 1 })).toBeVisible();
+    await check(page.getByRole("button", { name: /Place order/ })).toBeEnabled();
+    await page.getByLabel(/Full name/).fill("Cancellation Fixture Buyer");
+    await page.getByLabel(/Phone number/).fill("01744445555");
+    await page.getByLabel(/Full delivery address/).fill("456 Cancellation Fixture Street");
+    await page.getByLabel(/District/).fill("Rajshahi");
+    const cancellationResponse = page.waitForResponse((response) => response.url() === `${origin}/api/orders` && response.request().method() === "POST", { timeout: 90_000 });
+    await page.getByRole("button", { name: /Place order/ }).click();
+    const cancelledOrderResponse = await cancellationResponse;
+    expect(cancelledOrderResponse.status()).toBe(201);
+    const cancelledOrder = await cancelledOrderResponse.json();
+    await check(page.getByRole("heading", { name: "Thank you for your order" })).toBeVisible();
+    await page.getByRole("link", { name: "Track your order" }).click();
+    await check(page.getByRole("heading", { name: cancelledOrder.orderNumber })).toBeVisible();
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.getByRole("button", { name: "Cancel order", exact: true }).click();
+    await check(page.getByText("Your cancellation request was processed.")).toBeVisible();
+    await check(page.getByText("Cancelled", { exact: true }).first()).toBeVisible();
+    await check(page.getByRole("button", { name: "Cancel order", exact: true })).toHaveCount(0);
+    await page.goto("/cart", { waitUntil: "domcontentloaded", timeout: 90_000 });
+    await check(page.getByText("Your cart is empty.")).toBeVisible();
+    console.info("Public COD: second cart item, fallback checkout and token-authorized cancellation verified");
 
     // Independently inspect the resulting order and stock in the real dashboard.
     // Use a fresh browser process: this Lambda headless build runs single-process.
@@ -145,7 +199,11 @@ async function main() {
     const sales = manager.locator("div.border-b").filter({ hasText: "Checkout Browser Item" }).filter({ hasText: "SALE" });
     await check(sales).toHaveCount(1);
     await check(sales.first()).toContainText("-2");
-    console.info(`Checkout browser smoke PASS; one order and one two-unit sale; Chromium ${browser.version()}; JS test client only`);
+    const cancelledInventory = manager.locator("tr").filter({ hasText: "Browser Cancellation Item" });
+    await check(cancelledInventory).toHaveCount(1);
+    await check(cancelledInventory.locator("td").nth(2)).toHaveText("2");
+    await check(manager.locator("div.border-b").filter({ hasText: "Browser Cancellation Item" }).filter({ has: manager.locator("p").filter({ hasText: /^CANCELLATION · sellable/ }) })).toHaveCount(1);
+    console.info(`Customer browser smoke PASS; persisted COD, cancellation and stock verified; Chromium ${browser.version()}; JS test client only`);
   } finally { await browser.close(); }
 }
 main().catch((error) => { console.error(error); process.exitCode = 1; });
