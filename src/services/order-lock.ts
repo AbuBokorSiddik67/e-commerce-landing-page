@@ -27,8 +27,8 @@ export async function assertNoUnresolvedCourier(tx: Prisma.TransactionClient, or
 }
 
 /**
- * A legacy writer could have moved an already-dispatched order back to an
- * earlier status. Status alone is not proof that its goods are in stock.
+ * Historical or imported records may contain dispatch evidence that conflicts
+ * with their current status. Status alone is not proof that goods are in stock.
  * Call only with the order lock held; never invent or rewrite old history.
  */
 export async function hasConflictingDispatchEvidence(tx: Prisma.TransactionClient, order: {
@@ -41,7 +41,10 @@ export async function hasConflictingDispatchEvidence(tx: Prisma.TransactionClien
     { toStatus: { in: dispatchedOrClosed } }, { fromStatus: { in: dispatchedOrClosed } },
   ] }, select: { id: true } });
   if (history) return true;
-  // Even a rejected legacy return indicates that the order was treated as
+  const delivery = await tx.ownDelivery.findUnique({ where: { orderId: order.id }, select: { id: true } });
+  if (delivery && await tx.ownDeliveryEvent.findFirst({ where: { deliveryId: delivery.id,
+    status: { in: ["DISPATCHED", "OUT_FOR_DELIVERY", "FAILED", "DELIVERED", "RETURNING", "RETURNED"] } }, select: { id: true } })) return true;
+  // Even a rejected historical return indicates that the order was treated as
   // dispatched. Its current pre-shipment status is therefore ambiguous.
   return Boolean(await tx.returnRequest.findFirst({ where: { orderId: order.id }, select: { id: true } }));
 }

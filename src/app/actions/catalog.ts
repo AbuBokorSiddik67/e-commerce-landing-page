@@ -4,10 +4,16 @@ import { PERMISSIONS } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 import { createCoupon, updateCoupon } from "@/services/coupons";
 import { moderateReview } from "@/services/reviews";
-import { executeProviderRefund, recordRefund, updateReturnStatus, createReturnRequest } from "@/services/returns";
+import { executeProviderRefund, recordRefund, updateReturnStatus, createReturnRequest, receiveReturnItems, inspectReturnReceipt } from "@/services/returns";
 import { updateCustomer } from "@/services/customers";
 import { uploadMedia } from "@/services/media";
 import { bool, finish, num, optionalStr, str } from "./helpers";
+
+function requiredQuantity(formData: FormData, field: string) {
+  const value = str(formData, field).trim();
+  if (!/^[0-9]+$/.test(value)) throw new Error(`${field} must be a whole number`);
+  return Number(value);
+}
 
 export async function saveCouponAction(formData: FormData) {
   const user = await requirePermission(PERMISSIONS.COUPON_WRITE);
@@ -46,6 +52,25 @@ export async function createReturnAction(formData: FormData) {
   await finish(`/dashboard/orders/${orderId}`, () => createReturnRequest({
     orderId, reason: str(formData, "reason"), details: str(formData, "details"), returnCharge: num(formData, "returnCharge"),
   }, user.id), "Return request created");
+}
+
+export async function receiveReturnAction(formData: FormData) {
+  const user = await requirePermission(PERMISSIONS.ORDER_WRITE);
+  await requirePermission(PERMISSIONS.INVENTORY_WRITE);
+  const orderId = str(formData, "orderId");
+  await finish(`/dashboard/orders/${orderId}`, () => receiveReturnItems({
+    returnRequestId: str(formData, "returnRequestId"), orderItemId: str(formData, "orderItemId"),
+    quantity: requiredQuantity(formData, "quantity"), idempotencyKey: str(formData, "idempotencyKey"),
+  }, user.id), "Warehouse receipt recorded. Stock is unchanged until inspection.");
+}
+
+export async function inspectReturnAction(formData: FormData) {
+  const user = await requirePermission(PERMISSIONS.ORDER_WRITE);
+  await requirePermission(PERMISSIONS.INVENTORY_WRITE);
+  const orderId = str(formData, "orderId");
+  await finish(`/dashboard/orders/${orderId}`, () => inspectReturnReceipt({ receiptId: str(formData, "receiptId"),
+    sellableQuantity: requiredQuantity(formData, "sellableQuantity"), damagedQuantity: requiredQuantity(formData, "damagedQuantity"),
+    note: str(formData, "note") || undefined }, user.id), "Inspection recorded and inventory balances updated");
 }
 
 export async function recordRefundAction(formData: FormData) {

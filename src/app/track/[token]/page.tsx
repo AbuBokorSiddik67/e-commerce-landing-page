@@ -24,7 +24,6 @@ export default async function TrackPage({ params }: { params: Promise<{ token: s
   }
   const shipment = order.shipments[order.shipments.length - 1];
   const courierName = shipment ? ((shipment.payload as { courierName?: string })?.courierName ?? shipment.providerCode) : "Not assigned yet";
-  const deliverableStatuses = new Set(["CONFIRMED", "PROCESSING", "READY_TO_SHIP", "SHIPPED", "OUT_FOR_DELIVERY", "DELIVERED"]);
 
   return (
     <div className="min-h-screen bg-ink-50 py-12">
@@ -57,7 +56,7 @@ export default async function TrackPage({ params }: { params: Promise<{ token: s
           {shipment && (
             <div className="mt-6 rounded-xl border border-ink-100 p-4">
               <h2 className="font-semibold">Delivery details</h2>
-              <p className="mt-2 text-sm text-ink-600">Courier: {courierName}{shipment.providerCode !== "manual" ? " (verified provider update)" : " (manual update)"}</p>
+              <p className="mt-2 text-sm text-ink-600">Courier: {courierName}{shipment.providerCode !== "manual" ? " (provider record)" : " (manual update)"}</p>
               {shipment.trackingId && <p className="mt-1 text-sm text-ink-600">Tracking ID: {shipment.trackingId}</p>}
               {shipment.trackingUrl && <a href={shipment.trackingUrl} target="_blank" rel="noopener noreferrer" className="mt-2 inline-block text-sm font-semibold text-brand-700 underline">Open courier tracking</a>}
             </div>

@@ -7,7 +7,9 @@ import {
   assignManualCourier, bookCourierShipment, cancelOrder, collectCod, expireEligibleReservations,
   settleCod, syncCourierTracking, updateOrderStatus,
 } from "@/services/orders";
-import { finish, num, str } from "./helpers";
+import { assignOwnDelivery, recordOwnDeliveryEvent } from "@/services/own-delivery";
+import { reconcileCourierBooking, reconcileCourierCancellation, requestCourierCancellation } from "@/services/courier-operations";
+import { bool, finish, num, str } from "./helpers";
 
 function path(id: string) { return `/dashboard/orders/${id}`; }
 
@@ -20,7 +22,7 @@ export async function orderStatusAction(formData: FormData) {
 export async function cancelOrderAction(formData: FormData) {
   const user = await requirePermission(PERMISSIONS.ORDER_WRITE);
   const id = str(formData, "id");
-  await finish(path(id), () => cancelOrder(id, user.id, str(formData, "reason", "Cancelled by staff")), "Order cancelled and stock restored where applicable");
+  await finish(path(id), () => cancelOrder(id, user.id, str(formData, "reason") || "Cancelled by staff"), "Cancellation recorded. Check stock, courier and payment reconciliation separately.");
 }
 
 export async function expireReservationsAction() {
@@ -59,6 +61,52 @@ export async function syncTrackingAction(formData: FormData) {
   const user = await requirePermission(PERMISSIONS.ORDER_WRITE);
   const id = str(formData, "id");
   await finish(path(id), () => syncCourierTracking(str(formData, "shipmentId"), user.id), "Tracking synchronized");
+}
+
+export async function assignOwnDeliveryAction(formData: FormData) {
+  const user = await requirePermission(PERMISSIONS.ORDER_WRITE);
+  const id = str(formData, "id");
+  await finish(path(id), () => assignOwnDelivery({ orderId: id, personId: str(formData, "personId"),
+    expectedPersonId: str(formData, "expectedPersonId") || undefined, note: str(formData, "note") || undefined }, user.id), "Shop delivery assigned");
+}
+
+export async function ownDeliveryEventAction(formData: FormData) {
+  const user = await requirePermission(PERMISSIONS.ORDER_WRITE);
+  const id = str(formData, "id");
+  await finish(path(id), () => recordOwnDeliveryEvent({ orderId: id,
+    status: str(formData, "status") as "DISPATCHED" | "OUT_FOR_DELIVERY" | "FAILED" | "DELIVERED" | "RETURNING" | "RETURNED" | "CANCELLED",
+    note: str(formData, "note") || undefined }, user.id), "Physical delivery event recorded; stock has not been returned");
+}
+
+export async function reconcileCourierBookingAction(formData: FormData) {
+  const user = await requirePermission(PERMISSIONS.ORDER_WRITE);
+  const id = str(formData, "id");
+  await finish(path(id), async () => {
+    if (!bool(formData, "confirmOriginalAccount")) throw new Error("Confirm that the original provider account and environment were checked");
+    const environment = str(formData, "environment");
+    if (!["sandbox", "live"].includes(environment)) throw new Error("Choose the original provider environment");
+    return reconcileCourierBooking({ shipmentId: str(formData, "shipmentId"), merchantReference: str(formData, "merchantReference"),
+      consignmentId: str(formData, "consignmentId"), trackingId: str(formData, "trackingId"),
+      sandbox: environment === "sandbox", evidence: str(formData, "evidence"), confirmOriginalAccount: true }, user.id);
+  }, "Staff booking evidence recorded; goods are not automatically returned");
+}
+
+export async function requestCourierCancellationAction(formData: FormData) {
+  const user = await requirePermission(PERMISSIONS.ORDER_WRITE);
+  const id = str(formData, "id");
+  await finish(path(id), () => requestCourierCancellation(str(formData, "shipmentId"), user.id),
+    "Courier cancellation requires reconciliation. No stock was released.");
+}
+
+export async function reconcileCourierCancellationAction(formData: FormData) {
+  const user = await requirePermission(PERMISSIONS.ORDER_WRITE);
+  const id = str(formData, "id");
+  await finish(path(id), async () => {
+    if (!bool(formData, "confirmOriginalAccount")) throw new Error("Confirm that the original courier account was checked");
+    return reconcileCourierCancellation({ shipmentId: str(formData, "shipmentId"),
+      outcome: str(formData, "outcome") as "CANCELLED" | "NOT_CANCELLED", evidence: str(formData, "evidence"),
+      confirmOriginalAccount: true }, user.id);
+  }, "Staff courier outcome recorded; warehouse receipt is still required");
 }
 
 export async function collectCodAction(formData: FormData) {

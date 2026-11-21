@@ -4,9 +4,8 @@ import { z } from "zod";
 import { prisma } from "@/lib/prisma";
 import { ConflictError, NotFoundError } from "@/lib/errors";
 import { RETURNABLE_ORDER_STATUSES, RETURN_TRANSITIONS } from "@/lib/order-lifecycle";
-import { compareStableIds, exactVariantQuantities } from "@/lib/inventory-invariants";
-import { adjustStock, hasRecordedOrderSale } from "./inventory";
-import { assertNoUnresolvedCourier, lockOrder } from "./order-lock";
+import { adjustStock, hasRecordedOrderSale, receiveDamagedStock } from "./inventory";
+import { lockOrder } from "./order-lock";
 
 export const returnSchema = z.object({
   orderId: z.string().min(1),
@@ -15,30 +14,21 @@ export const returnSchema = z.object({
   returnCharge: z.coerce.number().int().nonnegative().default(0),
 });
 
-function hasExactReturnRestoration(
-  items: Array<{ variantId: string | null; quantity: number }>,
-  movements: Array<{ variantId: string | null; quantity: number; type: string }>,
-) {
-  return movements.every((movement) => movement.type === "RETURN") && exactVariantQuantities(items, movements);
-}
-
 export async function createReturnRequest(raw: z.input<typeof returnSchema>, actorId: string) {
   const input = returnSchema.parse(raw);
   const { request, orderNumber } = await prisma.$transaction(async (tx) => {
     await lockOrder(tx, input.orderId);
     const order = await tx.order.findUniqueOrThrow({ where: { id: input.orderId } });
     if (!RETURNABLE_ORDER_STATUSES.includes(order.status)) {
-      throw new ConflictError("Returns can only be requested for shipped or delivered orders");
+      throw new ConflictError("Returns can only be requested for shipped, delivered or cancelled orders");
     }
-    await assertNoUnresolvedCourier(tx, order.id);
-    // All requests are whole-order requests. A completed or otherwise existing
-    // non-rejected request must not be followed by a second full restock.
-    const existing = await tx.returnRequest.findFirst({ where: { orderId: order.id, status: { not: "REJECTED" } } });
-    if (existing) throw new ConflictError("A return request already exists for this order");
-    const request = await tx.returnRequest.create({
-      data: { orderId: order.id, productId: order.productId, reason: input.reason,
-        details: input.details ?? null, returnCharge: input.returnCharge },
-    });
+    // Completed partial returns do not prevent another request for remaining
+    // units. All receipts across all requests are capped under the order lock.
+    const existing = await tx.returnRequest.findFirst({ where: { orderId: order.id,
+      status: { notIn: ["REJECTED", "COMPLETED"] } } });
+    if (existing) throw new ConflictError("An open return request already exists for this order");
+    const request = await tx.returnRequest.create({ data: { orderId: order.id, productId: order.productId,
+      reason: input.reason, details: input.details ?? null, returnCharge: input.returnCharge } });
     await tx.auditLog.create({ data: { actorId, action: "CREATE_RETURN", entity: "ReturnRequest", entityId: request.id,
       after: { orderId: order.id, reason: input.reason } } });
     return { request, orderNumber: order.orderNumber };
@@ -52,70 +42,209 @@ export async function createReturnRequest(raw: z.input<typeof returnSchema>, act
   return request;
 }
 
+const receiptSchema = z.object({
+  returnRequestId: z.string().min(1),
+  orderItemId: z.string().min(1),
+  quantity: z.number().int().positive().max(2_147_483_647),
+  idempotencyKey: z.string().uuid(),
+});
+
+function receiptId(orderId: string, key: string) {
+  return `receipt_${createHash("sha256").update(JSON.stringify(["v1", orderId, key])).digest("hex")}`;
+}
+
+async function lockOrderItems(tx: Prisma.TransactionClient, orderId: string) {
+  await tx.$queryRaw`SELECT "id" FROM "OrderItem" WHERE "orderId" = ${orderId} ORDER BY "id" FOR SHARE`;
+}
+
+/** Receipt records physical custody only. It does not change either stock balance. */
+export async function receiveReturnItems(raw: z.input<typeof receiptSchema>, actorId: string) {
+  const input = receiptSchema.parse(raw);
+  const pointer = await prisma.returnRequest.findUnique({ where: { id: input.returnRequestId }, select: { orderId: true } });
+  if (!pointer) throw new NotFoundError("Return request not found");
+  return prisma.$transaction(async (tx) => {
+    await lockOrder(tx, pointer.orderId);
+    await lockOrderItems(tx, pointer.orderId);
+    const id = receiptId(pointer.orderId, input.idempotencyKey);
+    const existing = await tx.returnReceipt.findUnique({ where: { id } });
+    if (existing) {
+      if (existing.orderId !== pointer.orderId || existing.returnRequestId !== input.returnRequestId
+        || existing.orderItemId !== input.orderItemId || existing.receivedQuantity !== input.quantity) {
+        throw new ConflictError("This receipt key was already used with different details");
+      }
+      return existing;
+    }
+    const request = await tx.returnRequest.findUnique({ where: { id: input.returnRequestId }, include: { order: { include: { items: true } } } });
+    if (!request || request.orderId !== pointer.orderId) throw new NotFoundError("Return request not found");
+    if (!["APPROVED", "IN_TRANSIT"].includes(request.status) || !RETURNABLE_ORDER_STATUSES.includes(request.order.status)) {
+      throw new ConflictError("Approve the open return before recording a warehouse receipt");
+    }
+    const item = request.order.items.find((row) => row.id === input.orderItemId);
+    if (!item || !Number.isInteger(item.quantity) || item.quantity <= 0) throw new ConflictError("Order item requires review");
+    const prior = await tx.returnReceipt.findMany({ where: { orderId: request.orderId, orderItemId: item.id },
+      select: { receivedQuantity: true } });
+    const total = prior.reduce((sum, row) => sum + row.receivedQuantity, 0);
+    if (!Number.isSafeInteger(total) || prior.some((row) => !Number.isInteger(row.receivedQuantity) || row.receivedQuantity <= 0)
+      || total + input.quantity > item.quantity) throw new ConflictError("Receipt exceeds the unreceived quantity for this order item");
+    const receipt = await tx.returnReceipt.create({ data: { id, orderId: request.orderId, returnRequestId: request.id,
+      orderItemId: item.id, receivedQuantity: input.quantity, receivedById: actorId } });
+    await tx.auditLog.create({ data: { actorId, action: "RETURN_RECEIVED", entity: "ReturnReceipt", entityId: id,
+      after: { orderId: request.orderId, returnRequestId: request.id, orderItemId: item.id, quantity: input.quantity } } });
+    return receipt;
+  });
+}
+
+const inspectionSchema = z.object({
+  receiptId: z.string().min(1),
+  sellableQuantity: z.number().int().nonnegative().max(2_147_483_647),
+  damagedQuantity: z.number().int().nonnegative().max(2_147_483_647),
+  note: z.string().trim().max(1000).optional(),
+});
+
+type ReturnOrderItem = { id: string; variantId: string | null; quantity: number };
+
+/**
+ * All non-sale order movements must be explained by inspected receipt lines.
+ * Older whole-order restorations and ambiguous legacy stock activity fail
+ * closed; no automatic historical repair or duplicate credit is attempted.
+ */
+async function checkedReceiptLedger(tx: Prisma.TransactionClient, orderId: string, productId: string, items: ReturnOrderItem[]) {
+  if (!items.length || items.some((item) => !item.variantId || !Number.isInteger(item.quantity) || item.quantity <= 0)
+    || !(await hasRecordedOrderSale(tx, orderId, productId, items))) {
+    throw new ConflictError("Order items and sale movements require review before inspection");
+  }
+  const receipts = await tx.returnReceipt.findMany({ where: { orderId }, include: {
+    returnRequest: { select: { orderId: true, status: true } },
+  } });
+  const receiptIds = receipts.map((receipt) => receipt.id);
+  const movements = await tx.stockMovement.findMany({ where: { OR: [
+    { reference: orderId, type: { not: "SALE" } },
+    ...(receiptIds.length ? [{ returnReceiptId: { in: receiptIds } }] : []),
+  ] }, select: { productId: true, variantId: true, quantity: true, type: true, bucket: true, returnReceiptId: true, reference: true } });
+  const itemById = new Map(items.map((item) => [item.id, item]));
+  const totals = new Map<string, number>();
+  for (const receipt of receipts) {
+    const item = itemById.get(receipt.orderItemId);
+    if (!item || receipt.returnRequest.orderId !== orderId || receipt.returnRequest.status === "REJECTED"
+      || !Number.isInteger(receipt.receivedQuantity) || receipt.receivedQuantity <= 0) {
+      throw new ConflictError("Return receipt evidence is inconsistent; staff review is required");
+    }
+    const total = (totals.get(item.id) ?? 0) + receipt.receivedQuantity;
+    if (!Number.isSafeInteger(total) || total > item.quantity) throw new ConflictError("Return receipts exceed the ordered quantity");
+    totals.set(item.id, total);
+    const linked = movements.filter((movement) => movement.returnReceiptId === receipt.id);
+    if (!receipt.inspectedAt) {
+      if (receipt.sellableQuantity !== null || receipt.damagedQuantity !== null || linked.length) {
+        throw new ConflictError("Uninspected receipt has conflicting stock activity");
+      }
+      continue;
+    }
+    const sellable = receipt.sellableQuantity;
+    const damaged = receipt.damagedQuantity;
+    if (sellable === null || damaged === null || !Number.isInteger(sellable) || !Number.isInteger(damaged)
+      || sellable < 0 || damaged < 0 || sellable + damaged !== receipt.receivedQuantity) {
+      throw new ConflictError("Inspected receipt quantities are inconsistent");
+    }
+    const expected = [["SELLABLE", sellable], ["DAMAGED", damaged]] as const;
+    for (const [bucket, quantity] of expected) {
+      const matched = linked.filter((movement) => movement.bucket === bucket);
+      if ((quantity === 0 && matched.length) || (quantity > 0 && (matched.length !== 1 || matched[0].quantity !== quantity))) {
+        throw new ConflictError("Inspected receipt stock ledger is incomplete or duplicated");
+      }
+    }
+    if (linked.some((movement) => movement.type !== "RETURN" || movement.reference !== orderId
+      || movement.productId !== productId || movement.variantId !== item.variantId)) {
+      throw new ConflictError("Return stock movement does not match its receipt");
+    }
+  }
+  if (movements.some((movement) => !movement.returnReceiptId || !receiptIds.includes(movement.returnReceiptId))) {
+    throw new ConflictError("Prior stock activity is not backed by an inspected receipt; staff review is required");
+  }
+  return { receipts, totals };
+}
+
+/** Inspection and both balance/ledger writes commit atomically under the order lock. */
+export async function inspectReturnReceipt(raw: z.input<typeof inspectionSchema>, actorId: string) {
+  const input = inspectionSchema.parse(raw);
+  const pointer = await prisma.returnReceipt.findUnique({ where: { id: input.receiptId }, select: { orderId: true } });
+  if (!pointer) throw new NotFoundError("Return receipt not found");
+  return prisma.$transaction(async (tx) => {
+    await lockOrder(tx, pointer.orderId);
+    await lockOrderItems(tx, pointer.orderId);
+    const receipt = await tx.returnReceipt.findUnique({ where: { id: input.receiptId }, include: {
+      returnRequest: true, order: { include: { items: true } }, orderItem: true,
+    } });
+    if (!receipt || receipt.orderId !== pointer.orderId) throw new NotFoundError("Return receipt not found");
+    if (receipt.inspectedAt) {
+      if (receipt.sellableQuantity !== input.sellableQuantity || receipt.damagedQuantity !== input.damagedQuantity
+        || (receipt.inspectionNote ?? "") !== (input.note ?? "")) {
+        throw new ConflictError("This receipt was already inspected with different details");
+      }
+      await checkedReceiptLedger(tx, receipt.orderId, receipt.order.productId, receipt.order.items);
+      return receipt;
+    }
+    if (!["APPROVED", "IN_TRANSIT"].includes(receipt.returnRequest.status)
+      || !RETURNABLE_ORDER_STATUSES.includes(receipt.order.status)) throw new ConflictError("This return is not open for inspection");
+    if (input.sellableQuantity + input.damagedQuantity !== receipt.receivedQuantity) {
+      throw new ConflictError("Sellable and damaged quantities must equal the physical receipt");
+    }
+    if (!receipt.returnRequest.restock && input.sellableQuantity) {
+      throw new ConflictError("This return is not marked for sellable restocking");
+    }
+    await checkedReceiptLedger(tx, receipt.orderId, receipt.order.productId, receipt.order.items);
+    const variantId = receipt.orderItem.variantId;
+    if (!variantId) throw new ConflictError("The ordered variant no longer exists; staff review is required");
+    const updated = await tx.returnReceipt.update({ where: { id: receipt.id }, data: {
+      sellableQuantity: input.sellableQuantity, damagedQuantity: input.damagedQuantity,
+      inspectionNote: input.note || null, inspectedById: actorId, inspectedAt: new Date(),
+    } });
+    if (input.sellableQuantity) await adjustStock(tx, { variantId, delta: input.sellableQuantity, type: "RETURN",
+      reason: `Inspected sellable return ${receipt.id}`, reference: receipt.orderId, returnReceiptId: receipt.id, actorId });
+    if (input.damagedQuantity) await receiveDamagedStock(tx, { variantId, quantity: input.damagedQuantity,
+      reference: receipt.orderId, returnReceiptId: receipt.id, actorId });
+    await tx.auditLog.create({ data: { actorId, action: "RETURN_INSPECTED", entity: "ReturnReceipt", entityId: receipt.id,
+      after: { orderId: receipt.orderId, sellable: input.sellableQuantity, damaged: input.damagedQuantity } } });
+    return updated;
+  });
+}
+
 export async function updateReturnStatus(id: string, status: "APPROVED" | "REJECTED" | "IN_TRANSIT" | "INSPECTED" | "RESTOCKED" | "REFUNDED" | "COMPLETED", actorId: string, note?: string) {
-  // This lookup only locates the order to lock. The request and order are read
-  // again under the lock before any eligibility decision or write.
   const pointer = await prisma.returnRequest.findUnique({ where: { id }, select: { orderId: true } });
   if (!pointer) throw new NotFoundError("Return request not found");
   return prisma.$transaction(async (tx) => {
     await lockOrder(tx, pointer.orderId);
+    await lockOrderItems(tx, pointer.orderId);
     await tx.$queryRaw`SELECT "id" FROM "ReturnRequest" WHERE "id" = ${id} FOR UPDATE`;
-    const request = await tx.returnRequest.findUnique({ where: { id }, include: { order: { include: { items: true, refunds: true } } } });
+    const request = await tx.returnRequest.findUnique({ where: { id }, include: {
+      order: { include: { items: true, refunds: true } }, receipts: true,
+    } });
     if (!request || request.orderId !== pointer.orderId) throw new NotFoundError("Return request not found");
-    if (request.status === status && status !== "RESTOCKED") return request;
-    if (request.status !== status && !RETURN_TRANSITIONS[request.status].includes(status)) {
+    if (request.status === status) return request;
+    if (!RETURN_TRANSITIONS[request.status].includes(status)) {
       throw new ConflictError(`Cannot change return from ${request.status} to ${status}`);
     }
-    if (!RETURNABLE_ORDER_STATUSES.includes(request.order.status)) {
-      throw new ConflictError("The order is no longer eligible for a return");
-    }
-    // A legacy or in-flight courier claim may still represent an external
-    // parcel. In particular, never restock it while the outcome is unknown.
-    await assertNoUnresolvedCourier(tx, request.orderId);
-    if (request.order.refunds.some((refund) => !["RECORDED", "REFUNDED"].includes(refund.status))) {
-      throw new ConflictError("A refund outcome is unresolved; reconcile it before changing this return");
-    }
-    const priorRestorations = await tx.stockMovement.findMany({
-      // Unknown legacy stock operations (including RELEASE) are ambiguous too.
-      where: { reference: request.orderId, type: { not: "SALE" } },
-      select: { variantId: true, quantity: true, type: true },
-    });
-    const exactReturn = hasExactReturnRestoration(request.order.items, priorRestorations);
-    if (request.status === status) {
-      if (!request.restock || !exactReturn) throw new ConflictError("Existing return restoration is ambiguous; staff reconciliation is required");
-      return request;
-    }
-    if (status === "RESTOCKED") {
-      if (!request.restock) throw new ConflictError("This return is not marked for restocking");
-      if (priorRestorations.length) throw new ConflictError("A prior stock restoration exists; staff reconciliation is required");
-      if (!request.order.items.length || request.order.items.some((item) => !item.variantId || !Number.isInteger(item.quantity) || item.quantity <= 0)
-        || !(await hasRecordedOrderSale(tx, request.orderId, request.order.productId, request.order.items))) {
-        throw new ConflictError("Order items and sale movements cannot be safely reconciled; staff review is required");
+    if (!RETURNABLE_ORDER_STATUSES.includes(request.order.status)) throw new ConflictError("The order is no longer eligible for a return");
+    if (status === "REJECTED" && request.receipts.length) throw new ConflictError("A received return cannot be rejected");
+    let ledger: Awaited<ReturnType<typeof checkedReceiptLedger>> | undefined;
+    if (["INSPECTED", "RESTOCKED", "REFUNDED", "COMPLETED"].includes(status)) {
+      if (!request.receipts.length || request.receipts.some((receipt) => !receipt.inspectedAt)) {
+        throw new ConflictError("Record and inspect every received item before advancing this return");
       }
-      for (const item of [...request.order.items].sort((a, b) => compareStableIds(a.variantId ?? "", b.variantId ?? ""))) {
-        await adjustStock(tx, { variantId: item.variantId!, delta: item.quantity, type: "RETURN",
-          reason: `Return ${request.id}`, reference: request.orderId, actorId });
-      }
+      ledger = await checkedReceiptLedger(tx, request.orderId, request.order.productId, request.order.items);
     }
-    if (status === "REFUNDED") {
-      if (request.restock && (request.status !== "RESTOCKED" || !exactReturn)) {
-        throw new ConflictError("Restock this return before recording its refund status");
-      }
-      if (!request.order.refunds.some((refund) => refund.amount > 0 && ["RECORDED", "REFUNDED"].includes(refund.status))) {
-        throw new ConflictError("Record a refund before marking this return refunded");
-      }
+    if (status === "REFUNDED" && !request.order.refunds.some((refund) => refund.amount > 0 && ["RECORDED", "REFUNDED"].includes(refund.status))) {
+      throw new ConflictError("Record a refund before marking this return refunded");
     }
-    if (status === "COMPLETED" && request.restock && !exactReturn) {
-      throw new ConflictError("Restock this return before completing it");
-    }
-    const updated = await tx.returnRequest.update({
-      where: { id }, data: { status, inspectionNote: note ?? request.inspectionNote,
-        resolvedAt: ["COMPLETED", "REJECTED"].includes(status) ? new Date() : null },
-    });
-    if (status === "COMPLETED") {
+    const updated = await tx.returnRequest.update({ where: { id }, data: { status,
+      inspectionNote: note ?? request.inspectionNote, resolvedAt: ["COMPLETED", "REJECTED"].includes(status) ? new Date() : null } });
+    // A partial return leaves the order status alone. Cancellation remains the
+    // commercial status even once every physically returned unit is received.
+    if (status === "COMPLETED" && request.order.status !== "CANCELLED" && ledger
+      && request.order.items.every((item) => ledger!.totals.get(item.id) === item.quantity)
+      && ledger.receipts.every((receipt) => Boolean(receipt.inspectedAt))) {
       await tx.order.update({ where: { id: request.orderId }, data: { status: "RETURNED" } });
       await tx.orderStatusHistory.create({ data: { orderId: request.orderId, fromStatus: request.order.status,
-        toStatus: "RETURNED", source: "MANUAL", note: note ?? "Return completed", createdById: actorId } });
+        toStatus: "RETURNED", source: "MANUAL", note: note ?? "All order items returned and inspected", createdById: actorId } });
     }
     await tx.auditLog.create({ data: { actorId, action: "UPDATE_RETURN", entity: "ReturnRequest", entityId: id,
       before: { status: request.status }, after: { status } } });
