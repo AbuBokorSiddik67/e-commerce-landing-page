@@ -85,8 +85,8 @@ export const pathaoProvider: CourierProvider = {
     };
   },
 
-  async getTracking(reference, credentials, sandbox) {
-    const base = apiBase(sandbox);
+  async getTracking(reference, credentials, sandbox, apiBaseOverride) {
+    const base = apiBase(sandbox, apiBaseOverride);
     const token = await accessToken(credentials, base);
     const result = await request<{ data?: { status?: string; description?: string; updated_at?: string } }>(
       `${base}/api/v1/orders/${encodeURIComponent(reference)}`,
@@ -95,8 +95,8 @@ export const pathaoProvider: CourierProvider = {
     return { status: result.data?.status ?? "UNKNOWN", description: result.data?.description, at: result.data?.updated_at ? new Date(result.data.updated_at) : undefined, raw: result };
   },
 
-  async cancelShipment(reference, credentials, sandbox) {
-    const base = apiBase(sandbox);
+  async cancelShipment(reference, credentials, sandbox, apiBaseOverride) {
+    const base = apiBase(sandbox, apiBaseOverride);
     const token = await accessToken(credentials, base);
     await request(`${base}/api/v1/orders/${encodeURIComponent(reference)}/cancel`, {
       method: "POST", headers: headers(token),

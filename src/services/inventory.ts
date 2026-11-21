@@ -11,9 +11,9 @@ export async function hasRecordedOrderSale(
 ) {
   const movements = await tx.stockMovement.findMany({
     where: { reference: orderId, type: "SALE" },
-    select: { productId: true, variantId: true, quantity: true, variant: { select: { productId: true } } },
+    select: { productId: true, variantId: true, quantity: true, bucket: true, variant: { select: { productId: true } } },
   });
-  return movements.every((movement) => movement.productId === productId && movement.variant?.productId === productId)
+  return movements.every((movement) => movement.bucket === "SELLABLE" && movement.productId === productId && movement.variant?.productId === productId)
     && exactVariantQuantities(items, movements.map((movement) => ({ ...movement, quantity: -movement.quantity })));
 }
 
@@ -33,6 +33,7 @@ export async function adjustStock(
     reason?: string;
     reference?: string;
     actorId?: string | null;
+    returnReceiptId?: string;
   },
 ) {
   const variant = await tx.productVariant.findUnique({ where: { id: input.variantId } });
@@ -60,8 +61,35 @@ export async function adjustStock(
       reason: input.reason,
       reference: input.reference,
       createdById: input.actorId ?? null,
+      ...(input.returnReceiptId ? { returnReceiptId: input.returnReceiptId } : {}),
     },
   });
+  return balanceAfter;
+}
+
+/** Damaged units are a separate, non-sellable balance with their own ledger. */
+export async function receiveDamagedStock(
+  tx: Tx,
+  input: { variantId: string; quantity: number; reference: string; returnReceiptId: string; actorId: string },
+) {
+  if (!Number.isInteger(input.quantity) || input.quantity <= 0 || input.quantity > 2_147_483_647) {
+    throw new ConflictError("Damaged quantity must be a positive integer");
+  }
+  const variant = await tx.productVariant.findUnique({ where: { id: input.variantId } });
+  if (!variant) throw new NotFoundError("Product variant not found");
+  const updated = await tx.productVariant.updateMany({
+    where: { id: input.variantId, damagedStock: { lte: 2_147_483_647 - input.quantity } },
+    data: { damagedStock: { increment: input.quantity } },
+  });
+  if (updated.count !== 1) throw new ConflictError("Damaged stock balance is too large");
+  const balanceAfter = (await tx.productVariant.findUniqueOrThrow({
+    where: { id: input.variantId }, select: { damagedStock: true },
+  })).damagedStock;
+  await tx.stockMovement.create({ data: {
+    productId: variant.productId, variantId: input.variantId, type: "RETURN", bucket: "DAMAGED",
+    quantity: input.quantity, balanceAfter, reason: `Inspected damaged return ${input.returnReceiptId}`,
+    reference: input.reference, returnReceiptId: input.returnReceiptId, createdById: input.actorId,
+  } });
   return balanceAfter;
 }
 

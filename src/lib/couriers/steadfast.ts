@@ -51,9 +51,9 @@ export const steadfastProvider: CourierProvider = {
     };
   },
 
-  async getTracking(reference, credentials, sandbox) {
+  async getTracking(reference, credentials, sandbox, apiBaseOverride) {
     const result = await request<{ tracking?: { status?: string; details?: string; date?: string }; message?: string }>(
-      `${apiBase(sandbox)}/orders/track/${encodeURIComponent(reference)}`, { headers: authHeaders(credentials) },
+      `${apiBase(sandbox, apiBaseOverride)}/orders/track/${encodeURIComponent(reference)}`, { headers: authHeaders(credentials) },
     );
     return {
       status: result.tracking?.status ?? "UNKNOWN",

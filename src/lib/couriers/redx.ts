@@ -68,13 +68,14 @@ export const redxProvider: CourierProvider = {
     };
   },
 
-  async getTracking(reference, credentials, sandbox) {
-    const auth = await request<{ token?: string }>(`${apiBase(sandbox)}/auth/token`, {
+  async getTracking(reference, credentials, sandbox, apiBaseOverride) {
+    const base = apiBase(sandbox, apiBaseOverride);
+    const auth = await request<{ token?: string }>(`${base}/auth/token`, {
       method: "POST", headers: { "Content-Type": "application/json", "X-API-KEY": credentials.apiKey }, body: "{}",
     });
     if (!auth.token) throw new Error("REDX authentication failed");
     const result = await request<{ parcel?: { status?: string; updated_at?: string } }>(
-      `${apiBase(sandbox)}/parcel/${encodeURIComponent(reference)}`,
+      `${base}/parcel/${encodeURIComponent(reference)}`,
       { headers: { Authorization: `Bearer ${auth.token}` } },
     );
     return { status: result.parcel?.status ?? "UNKNOWN", at: result.parcel?.updated_at ? new Date(result.parcel.updated_at) : undefined, raw: result };

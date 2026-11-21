@@ -1,6 +1,8 @@
 # Phase 1 — inventory and order integrity
 
-> **Gate: FAIL. Do not deploy, enable the risky workflows, or advance to Phase 2.** Three unskipped tests using the actual pre-upgrade order writer demonstrate unsafe mixed-version stock restoration and courier booking. No enforceable old-writer fence or verified provider reconciliation exists. The work below is partial remediation, not release approval.
+> **Historical audit snapshot.** The mixed-version tests and cutover-gate discussion below describe an earlier deployment premise. The current request specifies one pre-production codebase and database, so hypothetical old/new production overlap is not a Phase 1 acceptance gate. The earlier test results remain historical evidence, not verification of the current implementation. See [the current implementation report](PHASE_1_IMPLEMENTATION.md) for the present scope, checks, and blockers.
+
+> **Historical gate: FAIL.** Three unskipped tests using the actual pre-upgrade order writer demonstrated unsafe mixed-version stock restoration and courier booking under that earlier premise. No enforceable old-writer fence or verified provider reconciliation was established in that audit.
 
 The worktree also contains preliminary refund and dashboard-permission edits made before the requested later-phase gates were satisfied. They are preserved rather than silently discarded, but are **premature, unapproved work**, not a Phase 2/3 pass. Reconcile their scope with the requested phase order before further development or use.
 

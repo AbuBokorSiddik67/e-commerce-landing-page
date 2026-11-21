@@ -30,6 +30,22 @@ enum StockMovementType {
   RELEASE
 }
 
+enum StockBucket {
+  SELLABLE
+  DAMAGED
+}
+
+enum OwnDeliveryStatus {
+  ASSIGNED
+  DISPATCHED
+  OUT_FOR_DELIVERY
+  FAILED
+  DELIVERED
+  RETURNING
+  RETURNED
+  CANCELLED
+}
+
 enum OrderStatus {
   PENDING
   CONFIRMED
@@ -142,6 +158,12 @@ model User {
   shipments     CourierShipment[]
   refunds       Refund[]
   statusChanges OrderStatusHistory[]
+  assignedDeliveries OwnDelivery[]       @relation("DeliveryPerson")
+  deliveryEvents     OwnDeliveryEvent[]  @relation("DeliveryEventActor")
+  deliveryPersonEvents OwnDeliveryEvent[] @relation("DeliveryEventPerson")
+  receivedReturns    ReturnReceipt[]      @relation("ReturnReceiver")
+  inspectedReturns   ReturnReceipt[]      @relation("ReturnInspector")
+  courierOperations  CourierOperation[]
 }
 
 model Role {
@@ -314,6 +336,7 @@ model ProductVariant {
   price            Int?
   compareAtPrice   Int?
   stock            Int              @default(0)
+  damagedStock     Int              @default(0)
   lowStockThreshold Int             @default(5)
   imageUrl         String?
   attributes       Json             @default("[]")
@@ -334,15 +357,19 @@ model StockMovement {
   product   Product           @relation(fields: [productId], references: [id], onDelete: Cascade)
   variant   ProductVariant?   @relation(fields: [variantId], references: [id], onDelete: SetNull)
   type      StockMovementType
+  bucket    StockBucket       @default(SELLABLE)
   quantity  Int
   balanceAfter Int
   reason    String?
   reference String?
+  returnReceiptId String?
+  returnReceipt ReturnReceipt? @relation(fields: [returnReceiptId], references: [id], onDelete: Restrict)
   createdById String?
   createdBy User?             @relation(fields: [createdById], references: [id], onDelete: SetNull)
   createdAt DateTime          @default(now())
   @@index([productId, createdAt])
   @@index([variantId, createdAt])
+  @@unique([returnReceiptId, bucket])
 }
 
 model StockReservation {
@@ -508,6 +535,8 @@ model Order {
   shippedAt           DateTime?
   deliveredAt         DateTime?
   cancelledAt         DateTime?
+  cancellationReason  String?
+  cancellationStockReleasedAt DateTime?
   expectedDeliveryAt  DateTime?
   codCollectedAt      DateTime?
   codSettledAt        DateTime?
@@ -520,7 +549,9 @@ model Order {
   paymentAttempts     PaymentAttempt[]
   refunds             Refund[]
   shipments           CourierShipment[]
+  ownDelivery         OwnDelivery?
   returns             ReturnRequest[]
+  returnReceipts      ReturnReceipt[]
   redemptions         CouponRedemption[]
   reviews             ProductReview[]
   analyticsEvents     AnalyticsEvent[]
@@ -546,6 +577,7 @@ model OrderItem {
   lineTotal Int
   attributes Json          @default("{}")
   imageUrl  String?
+  returnReceipts ReturnReceipt[]
 }
 
 model OrderStatusHistory {
@@ -658,6 +690,7 @@ model CourierShipment {
   createdById    String?
   createdBy      User?                 @relation(fields: [createdById], references: [id], onDelete: SetNull)
   trackingEvents CourierTrackingEvent[]
+  operations     CourierOperation[]
   createdAt      DateTime              @default(now())
   updatedAt      DateTime              @updatedAt
   @@index([orderId])
@@ -674,6 +707,56 @@ model CourierTrackingEvent {
   eventAt     DateTime       @default(now())
   source      String         @default("MANUAL")
   raw         Json           @default("{}")
+}
+
+// A single durable operation per shipment and kind. A pending or unknown
+// provider write is never retried automatically.
+model CourierOperation {
+  id                String          @id @default(cuid())
+  shipmentId        String
+  shipment          CourierShipment @relation(fields: [shipmentId], references: [id], onDelete: Restrict)
+  kind              String
+  status            String
+  providerCode      String
+  sandbox           Boolean
+  configurationMac  String
+  externalReference String
+  evidence          String?
+  outcome           String?
+  createdById       String?
+  createdBy         User?           @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  @@unique([shipmentId, kind])
+  @@index([status, createdAt])
+}
+
+// The delivery state is independent of Order.status, especially after a
+// customer cancels while goods are already in transit.
+model OwnDelivery {
+  id          String            @id @default(cuid())
+  orderId     String            @unique
+  order       Order             @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  personId    String
+  person      User              @relation("DeliveryPerson", fields: [personId], references: [id], onDelete: Restrict)
+  status      OwnDeliveryStatus @default(ASSIGNED)
+  events      OwnDeliveryEvent[]
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+}
+
+model OwnDeliveryEvent {
+  id          String            @id @default(cuid())
+  deliveryId  String
+  delivery    OwnDelivery       @relation(fields: [deliveryId], references: [id], onDelete: Restrict)
+  status      OwnDeliveryStatus
+  personId    String?
+  person      User?             @relation("DeliveryEventPerson", fields: [personId], references: [id], onDelete: SetNull)
+  actorId     String?
+  actor       User?             @relation("DeliveryEventActor", fields: [actorId], references: [id], onDelete: SetNull)
+  note        String?
+  createdAt   DateTime          @default(now())
+  @@index([deliveryId, createdAt])
 }
 
 model DeliveryRule {
@@ -735,9 +818,35 @@ model ReturnRequest {
   refundAmount   Int          @default(0)
   returnCharge   Int          @default(0)
   resolvedAt     DateTime?
+  receipts       ReturnReceipt[]
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
   @@index([status, createdAt])
+}
+
+// Receipt is physical evidence, not an inventory credit. Inspection is a
+// one-time split of that received quantity into sellable and damaged units.
+model ReturnReceipt {
+  id               String         @id
+  orderId          String
+  order            Order          @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  returnRequestId  String
+  returnRequest    ReturnRequest  @relation(fields: [returnRequestId], references: [id], onDelete: Restrict)
+  orderItemId      String
+  orderItem        OrderItem      @relation(fields: [orderItemId], references: [id], onDelete: Restrict)
+  receivedQuantity Int
+  receivedById     String?
+  receivedBy       User?          @relation("ReturnReceiver", fields: [receivedById], references: [id], onDelete: SetNull)
+  sellableQuantity Int?
+  damagedQuantity  Int?
+  inspectionNote   String?
+  inspectedById    String?
+  inspectedBy      User?          @relation("ReturnInspector", fields: [inspectedById], references: [id], onDelete: SetNull)
+  inspectedAt      DateTime?
+  movements        StockMovement[]
+  createdAt        DateTime       @default(now())
+  @@index([orderId, orderItemId])
+  @@index([returnRequestId, createdAt])
 }
 
 model ProductReview {

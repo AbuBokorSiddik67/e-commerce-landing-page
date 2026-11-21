@@ -35,10 +35,12 @@ export interface CourierProvider {
     district: string; area?: string | null; weightGrams: number; sandbox: boolean; credentials: Credentials;
   }): Promise<number | null>;
   createShipment(input: ShipmentInput): Promise<CourierBooking>;
-  getTracking(reference: string, credentials: Credentials, sandbox: boolean): Promise<{
+  getTracking(reference: string, credentials: Credentials, sandbox: boolean, apiBaseOverride?: string | null): Promise<{
     status: string; description?: string; at?: Date; raw: Record<string, unknown>;
   }>;
-  cancelShipment?(reference: string, credentials: Credentials, sandbox: boolean): Promise<boolean>;
+  // A boolean is only the adapter's report, not authoritative evidence of
+  // physical return or even necessarily provider-confirmed cancellation.
+  cancelShipment?(reference: string, credentials: Credentials, sandbox: boolean, apiBaseOverride?: string | null): Promise<boolean>;
 }
 
 export async function request<T>(url: string, init: RequestInit = {}): Promise<T> {

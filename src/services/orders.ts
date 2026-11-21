@@ -3,13 +3,12 @@ import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import type { CourierProviderConfiguration, CourierShipment, Order, OrderStatus, Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
-import { audit } from "@/lib/audit";
 import { ConflictError, NotFoundError } from "@/lib/errors";
 import { orderNumber, randomToken } from "@/lib/crypto";
 import { addressSchema, emailSchema, nameSchema, phoneSchema } from "@/lib/validation";
 import { lineTotals, validateCoupon } from "@/lib/pricing";
 import { normalizeStoredVariantAttributes } from "@/lib/product-attributes";
-import { assertPaymentMethodAvailable, calculateDeliveryCharge, getBusinessSettings, getCourierCredential, getCourierCredentialFromSnapshot, getPaymentCredential } from "@/lib/settings";
+import { assertPaymentMethodAvailable, calculateDeliveryCharge, getBusinessSettings, getCourierCredentialFromSnapshot, getPaymentCredential } from "@/lib/settings";
 import { getPaymentProvider } from "@/lib/payments/registry";
 import { getCourierProvider } from "@/lib/couriers/registry";
 import type { ShipmentInput } from "@/lib/couriers/types";
@@ -133,6 +132,16 @@ export async function placeOrder(raw: CheckoutInput) {
       },
       update: { name: input.customer.name, email: input.customer.email || null },
     });
+    // The preflight query is only an optimization. Serialize checkouts for the
+    // same customer and recheck after that lock, so concurrent submissions of
+    // different variants cannot both pass the time-window duplicate rule.
+    const customerLock = await tx.$queryRaw<Array<{ id: string }>>`
+      SELECT "id" FROM "Customer" WHERE "id" = ${customer.id} FOR UPDATE
+    `;
+    if (!customerLock.length) throw new ConflictError("Customer details changed while placing the order");
+    const duplicateAfterLock = await tx.order.findFirst({ where: { customerId: customer.id, productId: product.id,
+      createdAt: { gte: new Date(Date.now() - 15_000) } }, select: { id: true } });
+    if (duplicateAfterLock) throw new ConflictError("An order was just submitted. Please wait before repeating.");
 
     const created = await tx.order.create({
       data: {
@@ -335,6 +344,51 @@ function canReleaseOnlineHold(order: CancellationOrder) {
   return neverStarted || terminalFailure;
 }
 
+function hasVerifiedOnlinePayment(order: CancellationOrder) {
+  const payment = order.payments.length === 1 ? order.payments[0] : null;
+  return order.paymentStatus === "PAID" && Boolean(order.paymentReference) && Boolean(payment?.verifiedAt)
+    && payment?.status === "PAID" && payment.reference === order.paymentReference
+    && payment.provider === order.paymentMethod && payment.amount === order.total && payment.currency === order.currency
+    && order.refunds.every((refund) => ["RECORDED", "REFUNDED"].includes(refund.status));
+}
+
+/** Called with the order locked. False means retain stock, not reject cancellation. */
+async function canReleaseCancellationStock(tx: Prisma.TransactionClient, order: CancellationOrder) {
+  if (!CANCELLABLE_ORDER_STATUSES.includes(order.status) || await hasConflictingDispatchEvidence(tx, order)) return false;
+  // A booking, including a pending claim, can already represent a handed-over
+  // parcel. Local courier statuses are not proof of physical possession.
+  if (await tx.courierShipment.findFirst({ where: { orderId: order.id }, select: { id: true } })) return false;
+  const delivery = await tx.ownDelivery.findUnique({ where: { orderId: order.id } });
+  if (delivery && !["ASSIGNED", "CANCELLED"].includes(delivery.status)) return false;
+  if (delivery && await tx.ownDeliveryEvent.findFirst({ where: {
+    deliveryId: delivery.id, status: { in: ["DISPATCHED", "OUT_FOR_DELIVERY", "FAILED", "DELIVERED", "RETURNING", "RETURNED"] },
+  }, select: { id: true } })) return false;
+  if (!order.items.length || order.items.some((item) => !item.variantId || !Number.isInteger(item.quantity) || item.quantity <= 0)
+    || !(await hasRecordedOrderSale(tx, order.id, order.productId, order.items))
+    || await hasOtherOrderStockMovement(tx, order.id)) return false;
+
+  if (order.paymentMethod === "cod") {
+    try { await assertConsistentCodPayment(tx, order); }
+    catch (error) { if (error instanceof ConflictError) return false; throw error; }
+  } else {
+    if (!exactVariantQuantities(order.items, order.reservations)) return false;
+    if (!hasVerifiedOnlinePayment(order)
+      && (order.reservations.some((reservation) => reservation.releasedAt) || !canReleaseOnlineHold(order))) return false;
+  }
+  // Lock and check every target before recording cancellation, so missing or
+  // full balances defer release instead of rolling the cancellation back.
+  const totals = new Map<string, number>();
+  for (const item of order.items) totals.set(item.variantId!, (totals.get(item.variantId!) ?? 0) + item.quantity);
+  for (const [variantId, quantity] of [...totals].sort(([a], [b]) => compareStableIds(a, b))) {
+    if (!Number.isSafeInteger(quantity) || quantity <= 0 || quantity > 2_147_483_647) return false;
+    const rows = await tx.$queryRaw<Array<{ stock: number }>>`
+      SELECT "stock" FROM "ProductVariant" WHERE "id" = ${variantId} FOR UPDATE
+    `;
+    if (!rows.length || rows[0].stock < 0 || rows[0].stock > 2_147_483_647 - quantity) return false;
+  }
+  return true;
+}
+
 async function cancelOrderLocked(
   tx: Prisma.TransactionClient, orderId: string, actorId: string | null, reason: string, expiryBefore?: Date,
 ) {
@@ -342,80 +396,68 @@ async function cancelOrderLocked(
   const order = await tx.order.findUniqueOrThrow({
     where: { id: orderId }, include: { items: true, payments: true, paymentAttempts: true, reservations: true, refunds: true },
   });
-  // The schema has no verified courier-cancellation evidence. Even an old
-  // FAILED/CANCELLED shipment or a PENDING claim may represent a real parcel.
-  // Never make its allocated stock resellable merely from a local status.
-  const shipment = await tx.courierShipment.findFirst({ where: { orderId }, select: { id: true } });
-  if (shipment) throw new ConflictError("A courier record exists; reconcile the external shipment before releasing stock");
-  if (order.status === "CANCELLED") return { order, changed: false };
-  if (!CANCELLABLE_ORDER_STATUSES.includes(order.status)) {
-    throw new ConflictError("A shipped, delivered or closed order cannot be cancelled; use the return workflow");
-  }
-  await assertNoConflictingDispatchEvidence(tx, order);
-  if (!["PENDING", "FAILED", "COD_PENDING"].includes(order.paymentStatus)) {
-    throw new ConflictError("A paid or authorized order requires payment reconciliation before cancellation");
-  }
-  // A COD label alone is not proof that an inconsistent legacy order was
-  // never paid. Do not restore stock when any financial evidence conflicts.
-  if (order.paymentMethod === "cod") {
-    if (order.paymentStatus !== "COD_PENDING") throw new ConflictError("COD payment evidence requires reconciliation before releasing stock");
-    await assertConsistentCodPayment(tx, order);
-  }
-  if (order.paymentMethod !== "cod" && !canReleaseOnlineHold(order)) {
-    throw new ConflictError("Online payment outcome is not proven failed or unstarted; reconcile it with the provider before releasing stock");
-  }
-  if (order.paymentMethod !== "cod" && (order.reservations.some((reservation) => reservation.releasedAt)
-    || !exactVariantQuantities(order.items, order.reservations))) {
-    throw new ConflictError("Online reservation does not match the order; staff reconciliation is required");
-  }
+  if (order.status === "CANCELLED") return { order, changed: false, stockReleased: Boolean(order.cancellationStockReleasedAt) };
+  if (order.status === "RETURNED") throw new ConflictError("This order has already been fully returned");
+  const stockReleased = await canReleaseCancellationStock(tx, order);
   if (expiryBefore) {
     const active = order.reservations.filter((reservation) => !reservation.releasedAt);
-    if (order.paymentMethod === "cod" || order.status !== "PENDING" || !active.length
+    if (!stockReleased || order.paymentMethod === "cod" || order.status !== "PENDING" || !active.length
       || active.some((reservation) => reservation.expiresAt > expiryBefore)) {
-      throw new ConflictError("This reservation is not eligible for expiry");
+      throw new ConflictError("This reservation is not safely eligible for expiry");
     }
   }
-  if (!order.items.length || order.items.some((item) => !item.variantId || !Number.isInteger(item.quantity) || item.quantity <= 0)
-    || !(await hasRecordedOrderSale(tx, order.id, order.productId, order.items))) {
-    throw new ConflictError("Order items and sale movements cannot be safely reconciled; staff review is required");
-  }
-  // RELEASE and other historical stock movements can also restore or alter
-  // stock. Do not assume that only RETURN/CANCELLATION could have done so.
-  if (await hasOtherOrderStockMovement(tx, order.id)) {
-    throw new ConflictError("Prior stock activity exists; staff reconciliation is required");
-  }
 
+  // Inspect the original history before appending the new cancellation event.
+  // An inconsistent ASSIGNED row may nevertheless have physical dispatch or
+  // conflicting courier evidence; do not rewrite it as a pre-dispatch event.
+  const delivery = await tx.ownDelivery.findUnique({ where: { orderId } });
+  const ownDeliveryRequiresReview = Boolean(delivery?.status === "ASSIGNED" && (
+    !CANCELLABLE_ORDER_STATUSES.includes(order.status)
+    || await hasConflictingDispatchEvidence(tx, order)
+    || await tx.courierShipment.findFirst({ where: { orderId }, select: { id: true } })
+  ));
   const now = new Date();
-  await tx.order.update({ where: { id: order.id }, data: { status: "CANCELLED", cancelledAt: now, internalNote: reason } });
+  await tx.order.update({ where: { id: order.id }, data: {
+    status: "CANCELLED", cancelledAt: now, cancellationReason: reason,
+    cancellationStockReleasedAt: stockReleased ? now : null,
+  } });
   await tx.orderStatusHistory.create({
     data: { orderId, fromStatus: order.status, toStatus: "CANCELLED", source: expiryBefore ? "RESERVATION_EXPIRY" : "MANUAL", note: reason, createdById: actorId },
   });
-  // A stable variant order avoids deadlocks for older multi-item orders.
-  for (const item of [...order.items].sort((a, b) => compareStableIds(a.variantId ?? "", b.variantId ?? ""))) {
-    await adjustStock(tx, {
-      variantId: item.variantId!, delta: item.quantity, type: "CANCELLATION",
-      reason: `Cancelled ${order.orderNumber}`, reference: order.id, actorId,
-    });
+  // A consistent pre-dispatch assignment must not send a cancelled order.
+  if (delivery?.status === "ASSIGNED" && !ownDeliveryRequiresReview) {
+    await tx.ownDelivery.update({ where: { id: delivery.id }, data: { status: "CANCELLED" } });
+    await tx.ownDeliveryEvent.create({ data: { deliveryId: delivery.id, status: "CANCELLED", personId: delivery.personId,
+      actorId, note: "Assignment cancelled before dispatch; warehouse receipt is separate" } });
   }
-  await tx.stockReservation.updateMany({ where: { orderId, releasedAt: null }, data: { releasedAt: now } });
-  await tx.auditLog.create({
-    data: { actorId, action: expiryBefore ? "EXPIRE_RESERVATION" : "CANCEL_ORDER", entity: "Order", entityId: orderId,
-      before: { status: order.status }, after: { status: "CANCELLED", reason } },
-  });
-  return { order, changed: true };
+  if (stockReleased) {
+    // Stable variant ordering prevents deadlocks for multi-item orders.
+    for (const item of [...order.items].sort((a, b) => compareStableIds(a.variantId ?? "", b.variantId ?? ""))) {
+      await adjustStock(tx, { variantId: item.variantId!, delta: item.quantity, type: "CANCELLATION",
+        reason: `Undispatched cancellation ${order.orderNumber}`, reference: order.id, actorId });
+    }
+    await tx.stockReservation.updateMany({ where: { orderId, releasedAt: null }, data: { releasedAt: now } });
+  }
+  await tx.auditLog.create({ data: { actorId, action: expiryBefore ? "EXPIRE_RESERVATION" : "CANCEL_ORDER",
+    entity: "Order", entityId: orderId, before: { status: order.status },
+    after: { status: "CANCELLED", reason, stockReleased, ownDeliveryRequiresReview } } });
+  return { order, changed: true, stockReleased };
 }
 
 export async function cancelOrder(orderId: string, actorId: string, reason: string) {
-  const result = await prisma.$transaction((tx) => cancelOrderLocked(tx, orderId, actorId, reason));
-  if (!result.changed) return;
-  try {
-    await notify({
-      type: "ORDER_CANCELLED", title: "Order cancelled", body: `Order ${result.order.orderNumber} was cancelled. ${reason}`,
-      orderId, channels: ["IN_APP", "EMAIL", "SMS"],
-    });
-  } catch (error) {
-    console.error("Cancellation committed but notification failed", { orderId, error });
+  const cleanReason = z.string().trim().min(1).max(500).parse(reason);
+  const result = await prisma.$transaction((tx) => cancelOrderLocked(tx, orderId, actorId, cleanReason));
+  if (result.changed) {
+    try {
+      await notify({
+        type: "ORDER_CANCELLED", title: "Order cancelled", body: `Order ${result.order.orderNumber} was cancelled. ${cleanReason}`,
+        orderId, channels: ["IN_APP", "EMAIL", "SMS"],
+      });
+    } catch (error) {
+      console.error("Cancellation committed but notification failed", { orderId, error });
+    }
   }
+  return { changed: result.changed, stockReleased: result.stockReleased };
 }
 
 /**
@@ -464,7 +506,7 @@ const STATUS_LABELS: Record<OrderStatus, string> = {
 type FulfillmentOrder = Prisma.OrderGetPayload<{ include: { items: true; reservations: true } }>;
 
 /** Shared by manual fulfillment and courier creation; called with the order locked. */
-async function assertAllocatedForFulfillment(tx: Prisma.TransactionClient, order: FulfillmentOrder) {
+export async function assertAllocatedForFulfillment(tx: Prisma.TransactionClient, order: FulfillmentOrder) {
   await assertNoConflictingDispatchEvidence(tx, order);
   const openReturn = await tx.returnRequest.findFirst({
     where: { orderId: order.id, status: { not: "REJECTED" } }, select: { id: true },
@@ -504,6 +546,10 @@ export async function updateOrderStatus(orderId: string, status: OrderStatus, ac
     if (order.status === status) return { order, changed: false };
     if (!MANUAL_ORDER_TRANSITIONS[order.status].includes(status)) {
       throw new ConflictError(`Cannot change order from ${order.status} to ${status}`);
+    }
+    if (["SHIPPED", "OUT_FOR_DELIVERY", "DELIVERED", "FAILED_DELIVERY"].includes(status)
+      && await tx.ownDelivery.findFirst({ where: { orderId, status: { not: "CANCELLED" } }, select: { id: true } })) {
+      throw new ConflictError("Use the shop-delivery workflow to record physical delivery events");
     }
     await assertNoUnresolvedCourier(tx, orderId);
     await assertAllocatedForFulfillment(tx, order);
@@ -698,7 +744,7 @@ export type CourierBookingEvidence = z.infer<typeof courierBookingSchema>;
 type CourierRaw = z.infer<typeof courierRawSchema>;
 type CourierClaimState = "AWAITING_RESULT" | "OUTCOME_UNKNOWN" | "RECONCILIATION_REQUIRED" | "BOOKED";
 
-const courierClaimMarkerSchema = z.object({
+export const courierClaimMarkerSchema = z.object({
   landiqBooking: z.object({
     version: z.literal(4),
     state: z.enum(["AWAITING_RESULT", "OUTCOME_UNKNOWN", "RECONCILIATION_REQUIRED", "BOOKED"]),
@@ -746,11 +792,11 @@ function courierRequestFingerprint(order: CourierOrder, providerCode: string, re
   return createHash("sha256").update(JSON.stringify(canonical(snapshot))).digest("hex");
 }
 
-function courierEndpointOverride(providerCode: string) {
+export function courierEndpointOverride(providerCode: string) {
   return process.env[`${providerCode.toUpperCase()}_API_BASE`] ?? null;
 }
 
-function courierConfigurationMac(config: CourierProviderConfiguration, credentials: ShipmentInput["credentials"],
+export function courierConfigurationMac(config: CourierProviderConfiguration, credentials: ShipmentInput["credentials"],
   endpointOverride = courierEndpointOverride(config.code)) {
   // A keyed MAC, not credentials or an unkeyed secret hash, binds the claim to
   // the provider account, environment and endpoint override. Production already
@@ -764,7 +810,7 @@ function courierConfigurationMac(config: CourierProviderConfiguration, credentia
   }))).digest("hex");
 }
 
-async function lockedCourierConfiguration(tx: Prisma.TransactionClient, providerCode: string) {
+export async function lockedCourierConfiguration(tx: Prisma.TransactionClient, providerCode: string) {
   await tx.$queryRaw`SELECT "id" FROM "CourierProviderConfiguration" WHERE "code" = ${providerCode} FOR SHARE`;
   return tx.courierProviderConfiguration.findUnique({ where: { code: providerCode } });
 }
@@ -812,6 +858,9 @@ function courierRequest(order: CourierOrder, sandbox: boolean, apiBaseOverride: 
 async function assertCourierOrderEligible(tx: Prisma.TransactionClient, order: FulfillmentOrder) {
   if (!COURIER_BOOKING_ORDER_STATUSES.includes(order.status)) {
     throw new ConflictError("Courier booking requires a confirmed, unshipped order");
+  }
+  if (await tx.ownDelivery.findFirst({ where: { orderId: order.id, status: { not: "CANCELLED" } }, select: { id: true } })) {
+    throw new ConflictError("This order is assigned to the shop's own delivery");
   }
   await assertAllocatedForFulfillment(tx, order);
 }
@@ -919,6 +968,38 @@ export async function finalizeCourierBooking(claim: PendingCourierClaim, rawBook
     const shipment = await tx.courierShipment.findUniqueOrThrow({ where: { id: claim.shipmentId } });
     const previouslyBooked = isOurClaim(shipment, claim, "BOOKED");
     if (!previouslyBooked && !isOurClaim(shipment, claim, "AWAITING_RESULT")) {
+      const staffResolution = z.object({ landiqStaffResolution: z.object({ kind: z.literal("BOOKING_RECORDED") }) }).safeParse(shipment.payload);
+      // The booking may have been recovered and then staff-recorded as
+      // cancelled while the original booking call was still in flight. Do not
+      // discard a late response or reopen a cancelled shipment silently.
+      if (shipment.status === "CANCELLED" && staffResolution.success
+        && isOurClaim({ ...shipment, status: "BOOKED" }, claim, "BOOKED")) {
+        const payload = shipment.payload as Prisma.JsonObject;
+        const same = shipment.consignmentId === booking.consignmentId && shipment.trackingId === booking.trackingId;
+        const priorLate = z.object({ landiqLateBooking: z.object({ consignmentId: z.string(), trackingId: z.string(), raw: courierRawSchema }) }).safeParse(payload);
+        if (same && priorLate.success && priorLate.data.landiqLateBooking.consignmentId === booking.consignmentId
+          && priorLate.data.landiqLateBooking.trackingId === booking.trackingId && isDeepStrictEqual(priorLate.data.landiqLateBooking.raw, booking.raw)) {
+          return { shipment, safe: false };
+        }
+        const updated = await tx.courierShipment.update({ where: { id: shipment.id }, data: same ? {
+          payload: { ...payload, landiqLateBooking: { consignmentId: booking.consignmentId, trackingId: booking.trackingId, raw: booking.raw } } as Prisma.InputJsonObject,
+        } : {
+          status: "PENDING", payload: { ...payload,
+            landiqBooking: { ...courierClaimMarkerSchema.parse(payload).landiqBooking, state: "RECONCILIATION_REQUIRED" },
+            conflictingProviderResult: { consignmentId: booking.consignmentId, trackingId: booking.trackingId,
+              trackingUrl: booking.trackingUrl ?? null, cost: booking.cost ?? 0, raw: booking.raw } } as Prisma.InputJsonObject,
+        } });
+        if (!same) {
+          const cancellation = await tx.courierOperation.findUnique({ where: { shipmentId_kind: { shipmentId: shipment.id, kind: "CANCEL" } } });
+          if (cancellation?.status === "RECONCILED") await tx.courierOperation.update({ where: { id: cancellation.id }, data: { status: "RECONCILIATION_REQUIRED" } });
+        }
+        await tx.courierTrackingEvent.create({ data: { shipmentId: shipment.id, status: same ? "CANCELLED" : "PENDING", source: "API",
+          description: same ? "Late booking response matched the staff-recorded cancelled parcel."
+            : "A late booking response conflicts with the recorded parcel; investigate every reference.", raw: booking.raw } });
+        await tx.auditLog.create({ data: { actorId: claim.actorId, action: same ? "COURIER_LATE_BOOKING_MATCHED" : "COURIER_RECONCILIATION_REQUIRED",
+          entity: "CourierShipment", entityId: shipment.id, after: { orderId: claim.orderId, conflicting: !same } } });
+        return { shipment: updated, safe: false };
+      }
       throw new ConflictError("Courier claim changed; reconciliation is required");
     }
     const currentConfig = await lockedCourierConfiguration(tx, claim.providerCode);
@@ -942,6 +1023,26 @@ export async function finalizeCourierBooking(claim: PendingCourierClaim, rawBook
       }
     }
     const priorPayload = z.object({ providerResponse: courierRawSchema }).safeParse(shipment.payload);
+    const staffResolution = z.object({ landiqStaffResolution: z.object({ kind: z.literal("BOOKING_RECORDED") }) }).safeParse(shipment.payload);
+    const sameStaffReferences = previouslyBooked && staffResolution.success
+      && shipment.consignmentId === booking.consignmentId && shipment.trackingId === booking.trackingId;
+    if (sameStaffReferences && configUnchanged && !otherShipment) {
+      if (priorPayload.success && shipment.trackingUrl === (booking.trackingUrl ?? null) && shipment.cost === (booking.cost ?? 0)
+        && isDeepStrictEqual(priorPayload.data.providerResponse, booking.raw)) return { shipment, safe };
+      // Staff may have recovered the known booking while the original request
+      // was still in flight. Matching late evidence enriches that same record;
+      // it is not a conflicting second parcel and never reopens the order.
+      const payload = shipment.payload as Prisma.JsonObject;
+      const updated = await tx.courierShipment.update({ where: { id: shipment.id }, data: {
+        trackingUrl: booking.trackingUrl ?? null, cost: booking.cost ?? 0,
+        payload: { ...payload, providerResponse: booking.raw } as Prisma.InputJsonObject,
+      } });
+      await tx.courierTrackingEvent.create({ data: { shipmentId: shipment.id, status: "BOOKED", source: "API",
+        description: "Late provider response matched the staff-recorded booking.", raw: booking.raw } });
+      await tx.auditLog.create({ data: { actorId: claim.actorId, action: "COURIER_LATE_BOOKING_MATCHED", entity: "CourierShipment",
+        entityId: shipment.id, after: { orderId: claim.orderId, safeToFulfill: safe } } });
+      return { shipment: updated, safe };
+    }
     const exactResponse = previouslyBooked && priorPayload.success
       && shipment.consignmentId === booking.consignmentId && shipment.trackingId === booking.trackingId
       && shipment.trackingUrl === (booking.trackingUrl ?? null) && shipment.cost === (booking.cost ?? 0)
@@ -1060,24 +1161,49 @@ export async function bookCourierShipment(orderId: string, providerCode: string,
 
 export async function syncCourierTracking(shipmentId: string, actorId: string) {
   const shipment = await prisma.courierShipment.findUniqueOrThrow({ where: { id: shipmentId }, include: { order: true } });
+  const marker = courierClaimMarkerSchema.safeParse(shipment.payload);
+  const reference = shipment.trackingId ?? shipment.consignmentId;
   if (shipment.providerCode === "manual") throw new ConflictError("Manual shipments cannot be synced with an API");
-  if (shipment.status === "PENDING" || !(shipment.trackingId || shipment.consignmentId)) {
-    throw new ConflictError("Courier booking is unresolved; tracking sync cannot establish that it is safe to retry or release stock");
+  if (shipment.status === "PENDING" || !reference || !marker.success || marker.data.landiqBooking.state !== "BOOKED"
+    || marker.data.landiqBooking.merchantReference !== shipment.order.orderNumber) {
+    throw new ConflictError("Courier booking or original account is unresolved; reconcile before tracking");
   }
   const provider = getCourierProvider(shipment.providerCode);
   if (!provider) throw new ConflictError("Unknown courier provider");
   const config = await prisma.courierProviderConfiguration.findUnique({ where: { code: shipment.providerCode } });
   if (!config?.enabled) throw new ConflictError("Courier provider is disabled");
-  const credentials = await getCourierCredential(shipment.providerCode);
-  const result = await provider.getTracking(shipment.trackingId ?? shipment.consignmentId ?? "", credentials, config.sandbox);
-  await prisma.courierTrackingEvent.create({
-    data: {
-      shipmentId, status: (result.status as "PENDING" | "BOOKED" | "IN_TRANSIT" | "OUT_FOR_DELIVERY" | "DELIVERED" | "FAILED") ?? "PENDING",
-      description: result.description ?? null, eventAt: result.at ?? new Date(), source: "API", raw: result.raw as never,
-    },
+  const credentials = await getCourierCredentialFromSnapshot(shipment.providerCode, config.credentials);
+  const endpoint = courierEndpointOverride(shipment.providerCode);
+  const mac = courierConfigurationMac(config, credentials, endpoint);
+  if (marker.data.landiqBooking.sandbox !== config.sandbox || marker.data.landiqBooking.configurationMac !== mac) {
+    throw new ConflictError("Courier account or endpoint changed; reconcile before tracking");
+  }
+  // Network I/O occurs without a database transaction. Only recognized enum
+  // values are stored; untrusted provider descriptions/raw echoes are not.
+  const result = await provider.getTracking(reference, credentials, config.sandbox, endpoint);
+  const normalized = typeof result.status === "string" ? result.status.trim().toUpperCase().replace(/[ -]+/g, "_") : "";
+  const known = ["PENDING", "BOOKED", "PICKED_UP", "IN_TRANSIT", "OUT_FOR_DELIVERY", "DELIVERED", "CANCELLED", "FAILED"] as const;
+  const status = known.find((value) => value === normalized);
+  await prisma.$transaction(async (tx) => {
+    await lockOrder(tx, shipment.orderId);
+    const current = await tx.courierShipment.findUniqueOrThrow({ where: { id: shipmentId } });
+    const currentMarker = courierClaimMarkerSchema.safeParse(current.payload);
+    const currentConfig = await lockedCourierConfiguration(tx, shipment.providerCode);
+    if (current.orderId !== shipment.orderId || current.providerCode !== shipment.providerCode
+      || (current.trackingId ?? current.consignmentId) !== reference || current.status === "PENDING"
+      || !currentMarker.success || currentMarker.data.landiqBooking.state !== "BOOKED"
+      || currentMarker.data.landiqBooking.configurationMac !== mac || !currentConfig?.enabled
+      || courierConfigurationMac(currentConfig, await getCourierCredentialFromSnapshot(shipment.providerCode, currentConfig.credentials), endpoint) !== mac) {
+      throw new ConflictError("Courier details changed while tracking; reconcile before recording the result");
+    }
+    await tx.courierTrackingEvent.create({ data: { shipmentId, status: status ?? current.status,
+      description: status ? `Provider reported ${status}` : "Provider returned an unrecognized status; check its portal.",
+      eventAt: result.at instanceof Date && Number.isFinite(result.at.getTime()) ? result.at : new Date(),
+      source: "API", raw: { recognized: Boolean(status) } } });
+    await tx.auditLog.create({ data: { actorId, action: "COURIER_SYNC", entity: "CourierShipment", entityId: shipmentId,
+      after: { status: status ?? "UNRECOGNIZED" } } });
   });
-  await audit({ actorId, action: "COURIER_SYNC", entity: "CourierShipment", entityId: shipmentId, after: { status: result.status } as never });
-  return result;
+  return { status: status ?? "UNRECOGNIZED" };
 }
 
 export async function collectCod(orderId: string, amount: number, actorId: string) {
@@ -1161,9 +1287,13 @@ export async function getOrderForAdmin(id: string) {
       customer: { include: { addresses: true } },
       product: true, items: true,
       statusHistory: { orderBy: { createdAt: "asc" } },
-      shipments: { include: { trackingEvents: { orderBy: { eventAt: "desc" } } } },
-      payments: true, refunds: true, returns: true, redemptions: true,
-      reviews: true,
+      shipments: { include: { trackingEvents: { orderBy: { eventAt: "desc" } }, operations: true } },
+      ownDelivery: { include: { person: { select: { id: true, name: true, isActive: true } },
+        events: { orderBy: { createdAt: "asc" }, include: { actor: { select: { name: true } }, person: { select: { name: true } } } } } },
+      payments: true, refunds: true,
+      returns: { include: { receipts: { orderBy: { createdAt: "asc" }, include: { orderItem: true,
+        receivedBy: { select: { name: true } }, inspectedBy: { select: { name: true } } } } } },
+      redemptions: true, reviews: true,
     },
   });
 }

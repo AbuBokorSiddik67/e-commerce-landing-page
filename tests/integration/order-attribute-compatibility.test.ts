@@ -51,7 +51,7 @@ beforeEach(() => {
   mocks.createOrder.mockResolvedValue({ id: "order-1", orderNumber: "TEST-1", customerId: "customer-1", total: 500, currency: "BDT" });
   mocks.transaction.mockImplementation(async (callback: (client: unknown) => Promise<unknown>) => callback({
     $queryRaw: vi.fn().mockResolvedValue([{ id: "locked" }]), product: { findUnique: mocks.findProduct },
-    customer: { upsert: mocks.customerUpsert }, order: { create: mocks.createOrder }, auditLog: { create: mocks.auditCreate },
+    customer: { upsert: mocks.customerUpsert }, order: { create: mocks.createOrder, findFirst: mocks.findOrder }, auditLog: { create: mocks.auditCreate },
   }));
 });
 
