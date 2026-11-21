@@ -52,7 +52,7 @@ describe("product edit page attribute compatibility", () => {
     ["legacy", { Size: "M, tall", Color: "Black" }],
   ])("loads %s attributes and preserves them when another field is edited", async (_shape, attributes) => {
     const { container } = await renderEditor(attributes);
-    expect(screen.getAllByLabelText(/^Attribute name/).map((input) => (input as HTMLTextAreaElement).value)).toEqual(["Size", "Color"]);
+    expect(screen.getAllByLabelText(/^Attribute name\s*\*?$/).map((input) => (input as HTMLTextAreaElement).value)).toEqual(["Size", "Color"]);
     expect(screen.getAllByLabelText("Attribute value").map((input) => (input as HTMLTextAreaElement).value)).toEqual(["M, tall", "Black"]);
     fireEvent.change(screen.getByLabelText(/Product name/), { target: { value: "Updated shirt" } });
     expect(submittedVariants(container)).toEqual([

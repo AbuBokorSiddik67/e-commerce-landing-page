@@ -2,7 +2,8 @@ import { NextResponse } from "next/server";
 import { assertSameOrigin } from "@/lib/http";
 import { placeOrder } from "@/services/orders";
 import { checkRateLimit } from "@/lib/rate-limit";
-import { AppError, toErrorMessage } from "@/lib/errors";
+import { AppError } from "@/lib/errors";
+import { ZodError } from "zod";
 import { headers } from "next/headers";
 
 export const runtime = "nodejs";
@@ -23,7 +24,11 @@ export async function POST(request: Request) {
       checkoutUrl: result.checkoutUrl,
     }, { status: 201 });
   } catch (error) {
-    return NextResponse.json({ error: toErrorMessage(error) }, { status: error instanceof AppError ? error.status : 400 });
+    if (error instanceof AppError) return NextResponse.json({ error: error.message }, { status: error.status });
+    if (error instanceof ZodError || error instanceof SyntaxError) return NextResponse.json({ error: "Invalid order details" }, { status: 400 });
+    // Internal/DB errors can include sensitive infrastructure details. If a
+    // response was lost, the client retains its checkout key for a safe retry.
+    return NextResponse.json({ error: "Unable to complete the order. Retry with the same details or contact the store." }, { status: 500 });
   }
 }
 

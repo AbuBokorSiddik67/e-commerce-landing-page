@@ -44,14 +44,14 @@ export interface CourierProvider {
 }
 
 export async function request<T>(url: string, init: RequestInit = {}): Promise<T> {
-  const response = await fetch(url, { ...init, signal: AbortSignal.timeout(20_000), cache: "no-store" });
-  const text = await response.text();
-  let parsed: unknown;
-  try {
-    parsed = text ? JSON.parse(text) : {};
-  } catch {
-    throw new Error(`Courier returned non-JSON response (${response.status}): ${text.slice(0, 120)}`);
-  }
-  if (!response.ok) throw new Error(`Courier HTTP ${response.status}: ${JSON.stringify(parsed).slice(0, 300)}`);
-  return parsed as T;
+  let response: Response;
+  try { response = await fetch(url, { ...init, signal: AbortSignal.timeout(20_000), cache: "no-store" }); }
+  catch { throw new Error("Courier request failed"); }
+  // Error bodies and URLs may echo provider credentials or customer data.
+  if (!response.ok) throw new Error(`Courier HTTP ${response.status}`);
+  let text: string;
+  try { text = await response.text(); }
+  catch { throw new Error("Courier response could not be read"); }
+  try { return (text ? JSON.parse(text) : {}) as T; }
+  catch { throw new Error(`Courier returned non-JSON response (${response.status})`); }
 }

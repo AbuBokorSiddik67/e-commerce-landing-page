@@ -151,6 +151,13 @@ describe.skipIf(!enabled)("product preservation on a fresh disposable PostgreSQL
     await postgres.initialise();
     await postgres.start();
     started = true;
+    // Refuse to contact a different listener if the selected port was taken.
+    const postmaster = (await readFile(path.join(directory, "postmaster.pid"), "utf8")).split("\n");
+    const spawned = (postgres as unknown as { process?: { pid?: number } }).process?.pid;
+    if (!spawned || Number(postmaster[0]) !== spawned || await realpath(postmaster[1]) !== await realpath(directory)
+      || Number(postmaster[3]) !== port || postmaster[4] !== scratch || postmaster[5] !== "127.0.0.1") {
+      throw new Error("Refusing to connect: local PostgreSQL process identity mismatch");
+    }
     const database = `product_${randomBytes(8).toString("hex")}`;
     const makeClient = (name: string) => new PrismaClient({ adapter: new PrismaPg({
       host: "127.0.0.1", port, user, password, database: name, ssl: false,
@@ -177,12 +184,23 @@ describe.skipIf(!enabled)("product preservation on a fresh disposable PostgreSQL
     state.client = makeClient(database);
     const identity = await identify(db());
     if (!(await matches(identity, database))) throw new Error("Refusing to write to an unverified database");
+    const [empty] = await db().$queryRaw<Array<{ tables: bigint; types: bigint }>>`
+      SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'S')) AS "tables",
+        (SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+        WHERE n.nspname = 'public' AND t.typtype IN ('e', 'c', 'd')) AS "types"
+    `;
+    if (Number(empty.tables) || Number(empty.types)) throw new Error("Refusing fixture DDL: database is not empty");
     console.info("Verified disposable product PostgreSQL identity", { host: "127.0.0.1", port, database, schema: "public", user, directory });
-    const fixture = await readFile(path.join(process.cwd(), "tests/fixtures/product-disposable-schema.sql"), "utf8");
-    for (const statement of fixture.replace(/^--.*$/gm, "").split(";").map((part) => part.trim()).filter(Boolean)) {
-      await db().$executeRawUnsafe(statement);
+    // Use the same current-schema, CREATE-only fixture as the Phase 1 suites.
+    // The former partial fixture did not contain the new stock columns.
+    const fixture = await readFile(path.join(process.cwd(), "tests/fixtures/phase1-disposable-schema.sql"), "utf8");
+    const statements = fixture.replace(/^--.*$/gm, "").split(";").map((part) => part.trim()).filter(Boolean);
+    if (!statements.length || statements.some((sql) => !/^CREATE\s+(?:TYPE|TABLE|(?:UNIQUE\s+)?INDEX)\s/i.test(sql))) {
+      throw new Error("Refusing non-CREATE-only fixture SQL");
     }
-    await db().$executeRaw`INSERT INTO "User" ("id") VALUES ('fixture-actor')`;
+    for (const statement of statements) await db().$executeRawUnsafe(statement);
+    await db().user.create({ data: { id: "fixture-actor", name: "Fixture actor", email: "product-fixture@fixture.invalid", passwordHash: "not-a-login" } });
   }, 60_000);
 
   afterEach(cleanup);
@@ -203,7 +221,11 @@ describe.skipIf(!enabled)("product preservation on a fresh disposable PostgreSQL
     const legacy = { "  Size,:\t": " M, tall: regular  ", "Line\r\nname": "first\r\nsecond" };
     await db().productVariant.update({ where: { id: created.variants[0].id }, data: { attributes: legacy } });
     const orderId = `order-${randomUUID()}`;
-    await db().$executeRaw`INSERT INTO "Order" ("id", "productId") VALUES (${orderId}, ${created.id})`;
+    const customer = await db().customer.create({ data: { name: "Fixture buyer", phone: "01700000000" } });
+    await db().order.create({ data: {
+      id: orderId, orderNumber: `fixture-${randomUUID()}`, customerId: customer.id, productId: created.id,
+      quantity: 1, subtotal: 500, total: 500, address: "Fixture address", district: "Rajshahi", trackingToken: randomUUID(),
+    } });
     const item = await db().orderItem.create({ data: {
       orderId, variantId: created.variants[0].id, name: "Original snapshot", unitPrice: 500, quantity: 1, lineTotal: 500, attributes: legacy,
     } });

@@ -14,7 +14,7 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
       <p className="mt-2 text-sm text-ink-500">Sign in to manage your installation.</p>
       {params.success === "password-reset" && <div className="alert-success mt-6">Password updated. Please sign in.</div>}
       <div className="mt-8"><LoginForm /></div>
-      <p className="mt-8 text-xs text-ink-400">No public registration exists. Owner accounts are created during installation or by an administrator.</p>
+      <p className="mt-8 text-xs text-ink-400">No public registration exists. The owner account is created during installation; staff accounts are created by an administrator.</p>
     </div>
   );
 }

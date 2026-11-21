@@ -6,12 +6,15 @@ export const dynamic = "force-dynamic";
 
 function csvCell(value: unknown) {
   const text = value == null ? "" : String(value);
-  return /[",\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+  // Spreadsheet applications may execute formulas from customer-controlled
+  // cells, even after whitespace. Prefix dangerous values as literal text.
+  const safe = /^[\t\r\n]/.test(text) || /^\s*[=+\-@]/.test(text) ? `'${text}` : text;
+  return /[",\r\n]/.test(safe) ? `"${safe.replaceAll('"', '""')}"` : safe;
 }
 
 export async function GET(request: Request) {
   const user = await getCurrentUser();
-  if (!user || !hasPermission(user.roles, PERMISSIONS.ORDER_VIEW)) return new Response("Unauthorized", { status: 403 });
+  if (!user || user.mustResetPassword || !hasPermission(user.roles, PERMISSIONS.ORDER_VIEW)) return new Response("Unauthorized", { status: 403 });
   const url = new URL(request.url);
   const status = url.searchParams.get("status");
   const from = url.searchParams.get("from");

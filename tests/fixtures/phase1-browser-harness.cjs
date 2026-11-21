@@ -108,6 +108,8 @@ async function main() {
   const managerRole = await client.role.create({ data: { key: "ORDER_MANAGER", name: "Fixture order manager" } });
   const storeManagerRole = await client.role.create({ data: { key: "MANAGER", name: "Fixture store manager" } });
   const viewerRole = await client.role.create({ data: { key: "VIEWER", name: "Fixture viewer" } });
+  const adminRole = await client.role.create({ data: { key: "ADMINISTRATOR", name: "Fixture administrator" } });
+  const ownerRole = await client.role.create({ data: { key: "OWNER", name: "Fixture owner" } });
   const userPassword = `Browser-${randomBytes(12).toString("hex")}!`;
   const passwordHash = await bcrypt.hash(userPassword, 10);
   const manager = await client.user.create({ data: { name: "Fixture Order Manager", email: "browser-manager@fixture.invalid",
@@ -116,6 +118,10 @@ async function main() {
     passwordHash, roles: { create: { roleId: storeManagerRole.id } } } });
   await client.user.create({ data: { name: "Fixture Viewer", email: "browser-viewer@fixture.invalid",
     passwordHash, roles: { create: { roleId: viewerRole.id } } } });
+  await client.user.create({ data: { name: "Fixture Admin", email: "browser-admin@fixture.invalid",
+    passwordHash, roles: { create: { roleId: adminRole.id } } } });
+  const owner = await client.user.create({ data: { name: "Fixture Owner", email: "browser-owner@fixture.invalid",
+    passwordHash, roles: { create: { roleId: ownerRole.id } } } });
   await client.businessSetting.create({ data: { name: "Disposable Browser Store" } });
   const product = await client.product.create({ data: { name: "Browser Fixture Item", slug: `browser-${randomUUID()}`,
     regularPrice: 500, status: "PUBLISHED", variants: { create: { name: "Fixture variant", stock: 1, attributes: [] } } }, include: { variants: true } });
@@ -206,7 +212,8 @@ Module._load=function(request,parent,isMain){const result=original.apply(this,ar
     checkoutSlug, checkoutProductId: checkoutProduct.id, checkoutVariantId: checkoutProduct.variants[0].id,
     cancelSlug, cancelProductId: cancelProduct.id, cancelVariantId: cancelProduct.variants[0].id,
     deliveryOrderId: deliveryOrder.id, financeOrderId: financeOrder.id, courierOrderId: courierOrder.id, knownCourierOrderId: knownCourierOrder.id,
-    managerEmail: "browser-manager@fixture.invalid", storeManagerEmail: "browser-store-manager@fixture.invalid", viewerEmail: "browser-viewer@fixture.invalid", password: userPassword }), { mode: 0o600 });
+    managerEmail: "browser-manager@fixture.invalid", storeManagerEmail: "browser-store-manager@fixture.invalid", viewerEmail: "browser-viewer@fixture.invalid",
+    adminEmail: "browser-admin@fixture.invalid", ownerId: owner.id, ownerRoleId: ownerRole.id, viewerRoleId: viewerRole.id, password: userPassword }), { mode: 0o600 });
   console.info(`Disposable browser fixture starting on port ${webPort}; credentials stay in the ignored test metadata file.`);
 }
 main().catch(async (error) => { console.error(error); await cleanup(); process.exitCode = 1; });

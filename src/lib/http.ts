@@ -1,5 +1,33 @@
 import { AppError } from "./errors";
 
+/** Read a small external callback without buffering an unbounded request body. */
+export async function readLimitedText(request: Request, limit: number) {
+  const length = request.headers.get("content-length");
+  if (length && /^\d+$/.test(length) && Number(length) > limit) {
+    throw new AppError("Request body is too large", "BODY_TOO_LARGE", 413);
+  }
+  if (!request.body) return "";
+  const reader = request.body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > limit) {
+        await reader.cancel().catch(() => undefined);
+        throw new AppError("Request body is too large", "BODY_TOO_LARGE", 413);
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    return text + decoder.decode();
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 /** Reject cross-site form/JSON posts to state-changing public endpoints. */
 export function assertSameOrigin(request: Request) {
   const origin = request.headers.get("origin");

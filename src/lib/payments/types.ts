@@ -53,33 +53,33 @@ export interface PaymentProvider {
 }
 
 export async function postJson<T>(url: string, body: unknown, headers: Record<string, string> = {}): Promise<T> {
-  const response = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json", ...headers },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(20_000),
-    cache: "no-store",
-  });
-  const text = await response.text();
-  let parsed: unknown;
+  let response: Response;
   try {
-    parsed = text ? JSON.parse(text) : {};
-  } catch {
-    throw new Error(`Provider returned non-JSON response (${response.status})`);
-  }
-  if (!response.ok) throw new Error(`Provider HTTP ${response.status}: ${JSON.stringify(parsed).slice(0, 300)}`);
-  return parsed as T;
+    response = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json", ...headers },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(20_000),
+      cache: "no-store",
+    });
+  } catch { throw new Error("Provider request failed"); }
+  return parseResponse<T>(response);
 }
 
 export async function getJson<T>(url: string, headers: Record<string, string> = {}): Promise<T> {
-  const response = await fetch(url, { headers: { Accept: "application/json", ...headers }, signal: AbortSignal.timeout(20_000), cache: "no-store" });
-  const text = await response.text();
-  let parsed: unknown;
+  let response: Response;
   try {
-    parsed = text ? JSON.parse(text) : {};
-  } catch {
-    throw new Error(`Provider returned non-JSON response (${response.status})`);
-  }
-  if (!response.ok) throw new Error(`Provider HTTP ${response.status}: ${JSON.stringify(parsed).slice(0, 300)}`);
-  return parsed as T;
+    response = await fetch(url, { headers: { Accept: "application/json", ...headers }, signal: AbortSignal.timeout(20_000), cache: "no-store" });
+  } catch { throw new Error("Provider request failed"); }
+  return parseResponse<T>(response);
+}
+
+async function parseResponse<T>(response: Response): Promise<T> {
+  // Gateway errors may echo request parameters, tokens and customer data.
+  if (!response.ok) throw new Error(`Provider HTTP ${response.status}`);
+  let text: string;
+  try { text = await response.text(); }
+  catch { throw new Error("Provider response could not be read"); }
+  try { return (text ? JSON.parse(text) : {}) as T; }
+  catch { throw new Error(`Provider returned non-JSON response (${response.status})`); }
 }

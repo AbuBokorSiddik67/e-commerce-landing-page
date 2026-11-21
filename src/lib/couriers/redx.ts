@@ -17,7 +17,7 @@ export const redxProvider: CourierProvider = {
       headers: { "Content-Type": "application/json", Accept: "application/json", "X-API-KEY": credentials.apiKey },
       body: "{}",
     });
-    return result.token ? { ok: true, message: "API key accepted" } : { ok: false, message: result.message ?? "Token request failed" };
+    return result.token ? { ok: true, message: "API key accepted" } : { ok: false, message: "Token request failed" };
   },
 
   async calculateCharge({ district, weightGrams, sandbox, credentials }) {
@@ -38,7 +38,7 @@ export const redxProvider: CourierProvider = {
     const auth = await request<{ token?: string; message?: string }>(`${base}/auth/token`, {
       method: "POST", headers: { "Content-Type": "application/json", "X-API-KEY": input.credentials.apiKey }, body: "{}",
     });
-    if (!auth.token) throw new Error(auth.message ?? "REDX authentication failed");
+    if (!auth.token) throw new Error("REDX authentication failed");
     const result = await request<{ parcel?: { id?: string; tracking_id?: string; delivery_fee?: number }; message?: string }>(
       `${base}/parcel`,
       {
@@ -58,7 +58,7 @@ export const redxProvider: CourierProvider = {
       },
     );
     const id = result.parcel?.id ?? result.parcel?.tracking_id;
-    if (!id) throw new Error(result.message ?? "REDX parcel creation failed");
+    if (!id) throw new Error("REDX parcel creation failed");
     return {
       consignmentId: String(id),
       trackingId: String(result.parcel?.tracking_id ?? id),

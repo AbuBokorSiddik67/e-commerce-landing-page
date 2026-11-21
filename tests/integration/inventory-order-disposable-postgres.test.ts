@@ -45,7 +45,7 @@ vi.mock("@/lib/couriers/registry", () => ({ getCourierProvider: (code: string) =
 import { assignManualCourier, bookCourierShipment, cancelOrder, collectCod, expireEligibleReservations, finalizeCourierBooking, placeOrder, processPaymentCallback, settleCod, syncCourierTracking, updateOrderStatus, type PendingCourierClaim } from "@/services/orders";
 // Byte-for-byte snapshot of the repository's pre-upgrade writer, not a model.
 import { bookCourierShipment as legacyBookCourierShipment, cancelOrder as legacyCancelOrder } from "../fixtures/legacy-f151222/orders";
-import { createReturnRequest, executeProviderRefund, recordRefund, updateReturnStatus } from "@/services/returns";
+import { createReturnRequest, executeProviderRefund, inspectReturnReceipt, receiveReturnItems, recordRefund, updateReturnStatus } from "@/services/returns";
 import { createProduct, setProductStatus, updateProduct } from "@/services/products";
 import { adjustStock, setStock } from "@/services/inventory";
 
@@ -127,6 +127,33 @@ async function movements(orderId: string, type: "CANCELLATION" | "RETURN" | "SAL
   return db().stockMovement.findMany({ where: { reference: orderId, type } });
 }
 
+/** Manager cancellation may close the commercial order even when evidence is
+ * ambiguous. Assert the stronger stock, reservation, retry and closure
+ * invariants instead of expecting the old blanket rejection. */
+async function expectCancellationRetainsStock(orderId: string, variantId: string, reason: string) {
+  const beforeStock = await stock(variantId);
+  const reservations = await db().stockReservation.findMany({ where: { orderId }, orderBy: { id: "asc" }, select: { id: true, releasedAt: true } });
+  const historyCount = await db().orderStatusHistory.count({ where: { orderId, toStatus: "CANCELLED" } });
+  expect(await movements(orderId, "CANCELLATION")).toHaveLength(0);
+  expect(await cancelOrder(orderId, actor, reason)).toEqual({ changed: true, stockReleased: false });
+  const order = await db().order.findUniqueOrThrow({ where: { id: orderId } });
+  expect(order.status).toBe("CANCELLED");
+  expect(order.cancellationStockReleasedAt).toBeNull();
+  expect(order.cancellationReason).toBe(reason);
+  expect(await stock(variantId)).toBe(beforeStock);
+  expect(await movements(orderId, "CANCELLATION")).toHaveLength(0);
+  expect(await db().stockReservation.findMany({ where: { orderId }, orderBy: { id: "asc" }, select: { id: true, releasedAt: true } })).toEqual(reservations);
+  expect(await cancelOrder(orderId, actor, "Retry")).toEqual({ changed: false, stockReleased: false });
+  expect(await db().orderStatusHistory.count({ where: { orderId, toStatus: "CANCELLED" } })).toBe(historyCount + 1);
+  expect(await stock(variantId)).toBe(beforeStock);
+  expect(await movements(orderId, "CANCELLATION")).toHaveLength(0);
+  await expect(updateOrderStatus(orderId, "CONFIRMED", actor)).rejects.toThrow(/Cannot change order from CANCELLED/);
+}
+
+async function receiveItem(returnRequestId: string, orderItemId: string, quantity = 1) {
+  return receiveReturnItems({ returnRequestId, orderItemId, quantity, idempotencyKey: randomUUID() }, actor);
+}
+
 async function readyForCourier(orderId: string) {
   await updateOrderStatus(orderId, "CONFIRMED", actor);
   await updateOrderStatus(orderId, "READY_TO_SHIP", actor);
@@ -162,7 +189,7 @@ async function identity(client: PrismaClient) {
   return value;
 }
 
-describe.skipIf(!enabled)("inventory and order integrity on a verified disposable PostgreSQL cluster (partial schema)", () => {
+describe.skipIf(!enabled)("inventory and order integrity on a verified disposable PostgreSQL cluster (current-schema fixture)", () => {
   beforeAll(async () => {
     const root = path.resolve(process.cwd(), "tmp");
     await mkdir(root, { recursive: true });
@@ -181,6 +208,12 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     await postgres.initialise();
     await postgres.start();
     started = true;
+    const pidFile = (await readFile(path.join(directory, "postmaster.pid"), "utf8")).split("\n");
+    const spawned = (postgres as unknown as { process?: { pid?: number } }).process?.pid;
+    if (!spawned || Number(pidFile[0]) !== spawned || await realpath(pidFile[1]) !== await realpath(directory)
+      || Number(pidFile[3]) !== port || pidFile[4] !== scratch || pidFile[5] !== host) {
+      throw new Error("Refusing to connect: local PostgreSQL process identity mismatch");
+    }
     const makeClient = (name: string) => new PrismaClient({ adapter: new PrismaPg({ host, port, user, password, database: name, ssl: false, max: 12 }) });
     const admin = makeClient("postgres");
     try {
@@ -200,13 +233,24 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
       || verified.username !== user || verified.port !== port || verified.host !== host || verified.schema !== "public") {
       throw new Error("Refusing fixture DDL and writes: database identity mismatch");
     }
+    const [empty] = await db().$queryRaw<Array<{ tables: bigint; types: bigint }>>`
+      SELECT (SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p', 'v', 'm', 'S')) AS "tables",
+        (SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+        WHERE n.nspname = 'public' AND t.typtype IN ('e', 'c', 'd')) AS "types"
+    `;
+    if (Number(empty.tables) || Number(empty.types)) throw new Error("Refusing fixture DDL: database is not empty");
     console.info("Verified disposable PostgreSQL identity", { host, port, database, schema: verified.schema, user, directory: verified.directory });
     workerConnection = { host, port, user, password, database, directory: verified.directory };
-    const fixture = await readFile(path.join(process.cwd(), "tests/fixtures/inventory-order-disposable-schema.sql"), "utf8");
-    for (const statement of fixture.replace(/^--.*$/gm, "").split(";").map((part) => part.trim()).filter(Boolean)) {
-      await db().$executeRawUnsafe(statement);
+    // The older partial fixture predates damaged stock and return receipts.
+    // Use the full current-schema test fixture, not a migration or db push.
+    const fixture = await readFile(path.join(process.cwd(), "tests/fixtures/phase1-disposable-schema.sql"), "utf8");
+    const statements = fixture.replace(/^--.*$/gm, "").split(";").map((part) => part.trim()).filter(Boolean);
+    if (!statements.length || statements.some((sql) => !/^CREATE\s+(?:TYPE|TABLE|(?:UNIQUE\s+)?INDEX)\s/i.test(sql))) {
+      throw new Error("Refusing non-CREATE-only fixture SQL");
     }
-    await db().$executeRaw`INSERT INTO "User" ("id") VALUES (${actor})`;
+    for (const statement of statements) await db().$executeRawUnsafe(statement);
+    await db().user.create({ data: { id: actor, name: "Fixture staff", email: "inventory-fixture@fixture.invalid", passwordHash: "not-a-login" } });
     await db().paymentMethodConfiguration.create({ data: { code: "sslcommerz", name: "Fixture", enabled: true, visible: true } });
     await db().courierProviderConfiguration.create({ data: { code: "fixture_courier", name: "Fixture Courier", enabled: true } });
     // Synthetic credentials only; the child worker intercepts every fetch.
@@ -255,7 +299,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     expect((await db().stockReservation.findUniqueOrThrow({ where: { id: legacyReservation.id } })).releasedAt).not.toBeNull();
   });
 
-  it.each(["cancellation", "return"] as const)("uses a stable variant lock order for mixed-case legacy IDs during %s versus a product edit", async (operation) => {
+  it.each(["cancellation", "return"] as const)("serializes %s against a product edit with mixed-case legacy variant IDs", async (operation) => {
     // PostgreSQL accepts imported IDs whose sort order differs between Unicode
     // codepoint comparison and localeCompare (unlike generated CUIDs).
     const suffix = randomUUID();
@@ -278,11 +322,17 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
       await adjustStock(tx, { variantId: second.id, delta: -1, type: "SALE", reference: placed.order.id });
     });
     let returnId: string | undefined;
+    let lowerReceipt: string | undefined;
+    let upperReceipt: string | undefined;
     if (operation === "return") {
       await ship(placed.order.id);
       const request = await createReturnRequest({ orderId: placed.order.id, reason: "Return multi-item order" }, actor);
       await updateReturnStatus(request.id, "APPROVED", actor);
-      await updateReturnStatus(request.id, "INSPECTED", actor);
+      const items = await db().orderItem.findMany({ where: { orderId: placed.order.id } });
+      lowerReceipt = (await receiveItem(request.id, items.find((item) => item.variantId === lowerId)!.id)).id;
+      upperReceipt = (await receiveItem(request.id, items.find((item) => item.variantId === upperId)!.id)).id;
+      expect(await stock(first.id)).toBe(1);
+      expect(await stock(second.id)).toBe(1);
       returnId = request.id;
     }
     const snapshot = await db().product.findUniqueOrThrow({ where: { id: product.id }, include: {
@@ -306,7 +356,8 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     await locked.promise;
     const restoration = (operation === "cancellation"
       ? cancelOrder(placed.order.id, actor, "Multi-item race")
-      : updateReturnStatus(returnId!, "RESTOCKED", actor)).then(() => null, (error: unknown) => error);
+      : inspectReturnReceipt({ receiptId: lowerReceipt!, sellableQuantity: 1, damagedQuantity: 0 }, actor))
+      .then(() => null, (error: unknown) => error);
     let editor: Promise<unknown> | undefined;
     try {
       await waitForBlocked('ProductVariant');
@@ -317,6 +368,11 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     expect(await restoration).toBeNull();
     const editorOutcome = await editor;
     if (editorOutcome !== null) expect(editorOutcome).toEqual(expect.objectContaining({ message: expect.stringMatching(/changed.*Reload/) }));
+    if (operation === "return") {
+      await inspectReturnReceipt({ receiptId: upperReceipt!, sellableQuantity: 1, damagedQuantity: 0 }, actor);
+      await updateReturnStatus(returnId!, "INSPECTED", actor);
+      await updateReturnStatus(returnId!, "RESTOCKED", actor);
+    }
     expect(await stock(first.id)).toBe(2);
     expect(await stock(second.id)).toBe(2);
     expect(await movements(placed.order.id, operation === "cancellation" ? "CANCELLATION" : "RETURN")).toHaveLength(2);
@@ -332,10 +388,8 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     if (problem === "financial state") await db().order.update({ where: { id: order.id }, data: { financialStatus: "PARTIALLY_SETTLED" } });
     if (problem === "payment reference") await db().order.update({ where: { id: order.id }, data: { paymentReference: "legacy-unknown" } });
     if (problem === "refund") await db().refund.create({ data: { orderId: order.id, amount: 100, reason: "Legacy refund" } });
-    await expect(cancelOrder(order.id, actor, "Inconsistent COD evidence")).rejects.toThrow(/COD.*reconciliation/);
-    expect((await db().order.findUniqueOrThrow({ where: { id: order.id } })).status).toBe("PENDING");
+    await expectCancellationRetainsStock(order.id, variantId, "Inconsistent COD evidence");
     expect(await stock(variantId)).toBe(1);
-    expect(await movements(order.id, "CANCELLATION")).toHaveLength(0);
   });
 
   it.each(
@@ -377,11 +431,9 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
       if (problem === "cancelled timestamp") await db().order.update({ where: { id: order.id }, data: { cancelledAt: new Date() } });
       if (problem === "rejected return") await db().returnRequest.create({ data: { orderId: order.id, productId: order.productId,
         reason: "Legacy return", status: "REJECTED" } });
-      await expect(cancelOrder(order.id, actor, "Inconsistent fulfillment history")).rejects.toThrow(/dispatch or return evidence/);
       await expect(updateOrderStatus(order.id, "CONFIRMED", actor)).rejects.toThrow(/dispatch or return evidence/);
-      expect((await db().order.findUniqueOrThrow({ where: { id: order.id } })).status).toBe("PENDING");
+      await expectCancellationRetainsStock(order.id, variantId, "Inconsistent fulfillment history");
       expect(await stock(variantId)).toBe(1);
-      expect(await movements(order.id, "CANCELLATION")).toHaveLength(0);
     },
   );
 
@@ -394,7 +446,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     expect(await db().orderStatusHistory.count({ where: { orderId: order.id, toStatus: "CANCELLED" } })).toBe(0);
   });
 
-  it.each(["missing", "wrong quantity", "wrong sign", "wrong product"] as const)("refuses cancellation, fulfillment and COD collection when the recorded sale is %s", async (problem) => {
+  it.each(["missing", "wrong quantity", "wrong sign", "wrong product"] as const)("retains stock and refuses fulfillment and COD collection when the recorded sale is %s", async (problem) => {
     const { order, variantId } = await sale();
     const where = { reference: order.id, type: "SALE" as const };
     if (problem === "missing") await db().stockMovement.deleteMany({ where });
@@ -404,14 +456,12 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
       const other = await fixtureProduct(1);
       await db().stockMovement.updateMany({ where, data: { productId: other.id } });
     }
-    await expect(cancelOrder(order.id, actor, "Inconsistent history")).rejects.toThrow(/sale movements/);
     await expect(updateOrderStatus(order.id, "CONFIRMED", actor)).rejects.toThrow(/sale movements/);
     await expect(collectCod(order.id, order.total, actor)).rejects.toThrow(/sale movements/);
+    await expectCancellationRetainsStock(order.id, variantId, "Inconsistent history");
     const current = await db().order.findUniqueOrThrow({ where: { id: order.id } });
-    expect(current.status).toBe("PENDING");
     expect(current.paymentStatus).toBe("COD_PENDING");
     expect(await stock(variantId)).toBe(1);
-    expect(await movements(order.id, "CANCELLATION")).toHaveLength(0);
   });
 
   it("blocks an additional restoration when a legacy RELEASE movement already references the order", async () => {
@@ -422,14 +472,13 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
       await tx.stockMovement.create({ data: { productId: order.productId, variantId, type: "RELEASE",
         reference: order.id, quantity: 1, balanceAfter: 2 } });
     });
-    await expect(cancelOrder(order.id, actor, "Already released")).rejects.toThrow(/Prior stock activity/);
     await expect(updateOrderStatus(order.id, "CONFIRMED", actor)).rejects.toThrow(/prior stock restoration/);
     await expect(collectCod(order.id, order.total, actor)).rejects.toThrow(/prior stock activity/);
+    await expectCancellationRetainsStock(order.id, variantId, "Already released");
     expect(await stock(variantId)).toBe(2);
-    expect(await movements(order.id, "CANCELLATION")).toHaveLength(0);
   });
 
-  it("serializes whole-order return creation and concurrent restocks; forbids reopening and the generic bypass", async () => {
+  it("serializes return creation and inspection, credits a physical receipt once, and forbids reopening", async () => {
     const { order, variantId } = await sale();
     await expect(updateOrderStatus(order.id, "CANCELLED", actor)).rejects.toThrow(/cancellation or return/);
     await expect(updateOrderStatus(order.id, "RETURNED", actor)).rejects.toThrow(/cancellation or return/);
@@ -442,13 +491,20 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     expect(requests.filter((result) => result.status === "rejected")).toHaveLength(1);
     const request = await db().returnRequest.findFirstOrThrow({ where: { orderId: order.id } });
     await updateReturnStatus(request.id, "APPROVED", actor);
+    await expect(updateReturnStatus(request.id, "INSPECTED", actor)).rejects.toThrow(/Record and inspect/);
+    const item = await db().orderItem.findFirstOrThrow({ where: { orderId: order.id } });
+    const receipt = await receiveItem(request.id, item.id);
+    expect(await stock(variantId)).toBe(1); // custody alone does not credit stock
+    const inspection = { receiptId: receipt.id, sellableQuantity: 1, damagedQuantity: 0 };
+    const inspections = await Promise.allSettled([inspectReturnReceipt(inspection, actor), inspectReturnReceipt(inspection, actor)]);
+    expect(inspections.every((outcome) => outcome.status === "fulfilled")).toBe(true);
     await updateReturnStatus(request.id, "INSPECTED", actor);
     const outcomes = await Promise.allSettled([
       updateReturnStatus(request.id, "RESTOCKED", actor), updateReturnStatus(request.id, "RESTOCKED", actor),
     ]);
     expect(outcomes.every((outcome) => outcome.status === "fulfilled")).toBe(true);
     expect(await stock(variantId)).toBe(2);
-    expect((await movements(order.id, "RETURN")).map((movement) => movement.quantity)).toEqual([1]);
+    expect((await movements(order.id, "RETURN")).map((movement) => [movement.quantity, movement.returnReceiptId])).toEqual([[1, receipt.id]]);
     await expect(updateOrderStatus(order.id, "OUT_FOR_DELIVERY", actor)).rejects.toThrow(/return or prior stock restoration/);
     await expect(updateReturnStatus(request.id, "APPROVED", actor)).rejects.toThrow(/Cannot change return/);
     await updateReturnStatus(request.id, "COMPLETED", actor);
@@ -466,25 +522,29 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     await db().stockMovement.create({ data: { productId: order.productId, variantId, type: "RETURN",
       reference: order.id, quantity: 2, balanceAfter: 3 } });
     await expect(updateReturnStatus(request.id, "RESTOCKED", actor)).rejects.toThrow(/ambiguous/);
-    await expect(updateReturnStatus(request.id, "COMPLETED", actor)).rejects.toThrow(/Restock/);
+    await expect(updateReturnStatus(request.id, "COMPLETED", actor)).rejects.toThrow(/Record and inspect/);
     expect((await db().order.findUniqueOrThrow({ where: { id: order.id } })).status).toBe("SHIPPED");
     expect(await stock(variantId)).toBe(1);
   });
 
-  it.each(["missing sale", "legacy release"] as const)("refuses to restock a return with %s", async (problem) => {
+  it.each(["missing sale", "legacy release"] as const)("refuses to inspect or credit a return with %s", async (problem) => {
     const { order, variantId } = await sale();
     await ship(order.id);
     const request = await createReturnRequest({ orderId: order.id, reason: "Damaged item" }, actor);
     await updateReturnStatus(request.id, "APPROVED", actor);
-    await updateReturnStatus(request.id, "INSPECTED", actor);
+    const item = await db().orderItem.findFirstOrThrow({ where: { orderId: order.id } });
+    const receipt = await receiveItem(request.id, item.id);
     if (problem === "missing sale") {
       await db().stockMovement.deleteMany({ where: { reference: order.id, type: "SALE" } });
     } else {
       await db().stockMovement.create({ data: { productId: order.productId, variantId, type: "RELEASE",
         reference: order.id, quantity: 1, balanceAfter: 2 } });
     }
-    await expect(updateReturnStatus(request.id, "RESTOCKED", actor)).rejects.toThrow(/sale movements|prior stock restoration/);
-    expect((await db().returnRequest.findUniqueOrThrow({ where: { id: request.id } })).status).toBe("INSPECTED");
+    await expect(inspectReturnReceipt({ receiptId: receipt.id, sellableQuantity: 1, damagedQuantity: 0 }, actor))
+      .rejects.toThrow(/sale movements|Prior stock activity/);
+    await expect(updateReturnStatus(request.id, "INSPECTED", actor)).rejects.toThrow(/Record and inspect/);
+    expect((await db().returnReceipt.findUniqueOrThrow({ where: { id: receipt.id } })).inspectedAt).toBeNull();
+    expect((await db().returnRequest.findUniqueOrThrow({ where: { id: request.id } })).status).toBe("APPROVED");
     expect((await db().order.findUniqueOrThrow({ where: { id: order.id } })).status).toBe("SHIPPED");
     expect(await stock(variantId)).toBe(1);
     expect(await movements(order.id, "RETURN")).toHaveLength(0);
@@ -577,10 +637,10 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     const attempt = await db().paymentAttempt.findFirstOrThrow({ where: { orderId: order.id } });
     expect(attempt.status).toBe("INITIALIZATION_UNKNOWN");
     expect(await stock(product.variants[0].id)).toBe(1);
-    await expect(cancelOrder(order.id, actor, "Timeout")).rejects.toThrow(/not proven failed/);
     await db().stockReservation.updateMany({ where: { orderId: order.id }, data: { expiresAt: new Date(0) } });
-    await expireEligibleReservations(actor);
+    expect((await expireEligibleReservations(actor)).expired).toBe(0);
     expect((await db().order.findUniqueOrThrow({ where: { id: order.id } })).status).toBe("PENDING");
+    await expectCancellationRetainsStock(order.id, product.variants[0].id, "Timeout");
   });
 
   it("expires an online hold when credential loading failed before any provider request was attempted", async () => {
@@ -608,7 +668,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     const payment = await db().paymentTransaction.findFirstOrThrow({ where: { orderId: online.order.id } });
     mocks.verify.mockResolvedValue({ status: "FAILED", terminalFailureVerified, reference: payment.reference, raw: {} });
     expect(await processPaymentCallback("sslcommerz", { tran_id: payment.reference })).toMatchObject({ ok: false, requiresReconciliation: true });
-    await expect(cancelOrder(online.order.id, actor, "Unverified terminal status")).rejects.toThrow(/not proven failed/);
+    await expectCancellationRetainsStock(online.order.id, online.variantId, "Unverified terminal status");
     expect((await db().paymentTransaction.findUniqueOrThrow({ where: { id: payment.id } })).status).toBe("INITIATED");
     expect(await stock(online.variantId)).toBe(1);
   });
@@ -620,7 +680,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     mocks.verify.mockResolvedValue({ status: "FAILED", reference: payment.reference, raw: {} });
     expect(await processPaymentCallback("sslcommerz", { tran_id: payment.reference })).toMatchObject({ ok: false, requiresReconciliation: true });
     expect((await expireEligibleReservations(actor)).expired).toBe(0);
-    await expect(cancelOrder(online.order.id, actor, "Attempt failed")).rejects.toThrow(/not proven failed/);
+    await expectCancellationRetainsStock(online.order.id, online.variantId, "Attempt failed");
     expect(await stock(online.variantId)).toBe(1);
     expect((await db().order.findUniqueOrThrow({ where: { id: online.order.id } })).paymentStatus).toBe("PENDING");
   });
@@ -631,12 +691,11 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     await db().paymentTransaction.updateMany({ where: { orderId: online.order.id }, data: { status: "FAILED" } });
     await db().paymentAttempt.updateMany({ where: { orderId: online.order.id }, data: { status: "FAILED" } });
     await db().stockReservation.updateMany({ where: { orderId: online.order.id }, data: { expiresAt: new Date(0) } });
-    await expect(cancelOrder(online.order.id, actor, "Legacy failed attempt")).rejects.toThrow(/not proven failed/);
     expect((await expireEligibleReservations(actor)).expired).toBe(0);
     expect((await db().order.findUniqueOrThrow({ where: { id: online.order.id } })).status).toBe("PENDING");
+    await expectCancellationRetainsStock(online.order.id, online.variantId, "Legacy failed attempt");
     expect((await db().stockReservation.findFirstOrThrow({ where: { orderId: online.order.id } })).releasedAt).toBeNull();
     expect(await stock(online.variantId)).toBe(1);
-    expect(await movements(online.order.id, "CANCELLATION")).toHaveLength(0);
   });
 
   it.each([
@@ -661,10 +720,8 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     if (problem === "duplicate initialization") await db().paymentAttempt.create({ data: { orderId: online.order.id, provider: "sslcommerz", status: "INITIATED" } });
     if (problem === "missing initialization") await db().paymentAttempt.deleteMany({ where: { orderId: online.order.id, status: "INITIATED" } });
     if (problem === "unknown attempt") await db().paymentAttempt.create({ data: { orderId: online.order.id, provider: "sslcommerz", status: "VERIFICATION_MISMATCH" } });
-    await expect(cancelOrder(online.order.id, actor, "Conflicting payment evidence")).rejects.toThrow(/reconciliation|not proven failed/);
-    expect((await db().order.findUniqueOrThrow({ where: { id: online.order.id } })).status).toBe("PENDING");
+    await expectCancellationRetainsStock(online.order.id, online.variantId, "Conflicting payment evidence");
     expect(await stock(online.variantId)).toBe(1);
-    expect(await movements(online.order.id, "CANCELLATION")).toHaveLength(0);
   });
 
   it.each(["financial state", "payment reference", "refund"] as const)("does not release an unstarted online hold with conflicting %s", async (problem) => {
@@ -677,8 +734,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     if (problem === "financial state") await db().order.update({ where: { id: order.id }, data: { financialStatus: "PARTIALLY_SETTLED" } });
     if (problem === "payment reference") await db().order.update({ where: { id: order.id }, data: { paymentReference: "legacy-reference" } });
     if (problem === "refund") await db().refund.create({ data: { orderId: order.id, amount: 100, reason: "Legacy refund" } });
-    await expect(cancelOrder(order.id, actor, "Conflicting financial evidence")).rejects.toThrow(/reconciliation|not proven failed/);
-    expect((await db().order.findUniqueOrThrow({ where: { id: order.id } })).status).toBe("PENDING");
+    await expectCancellationRetainsStock(order.id, product.variants[0].id, "Conflicting financial evidence");
     expect(await stock(product.variants[0].id)).toBe(1);
     expect(mocks.initialize).not.toHaveBeenCalled();
   });
@@ -694,13 +750,12 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     if (problem === "missing") await db().stockReservation.deleteMany({ where: { orderId: order.id } });
     if (problem === "wrong quantity") await db().stockReservation.updateMany({ where: { orderId: order.id }, data: { quantity: 2, expiresAt: new Date(0) } });
     if (problem === "already released") await db().stockReservation.updateMany({ where: { orderId: order.id }, data: { releasedAt: new Date(), expiresAt: new Date(0) } });
-    await expect(cancelOrder(order.id, actor, "Unclear reservation")).rejects.toThrow(/reservation does not match/);
     const result = await expireEligibleReservations(actor);
     expect(result.expired).toBe(0);
     if (problem === "wrong quantity") expect(result.deferred).toBe(1);
     expect((await db().order.findUniqueOrThrow({ where: { id: order.id } })).status).toBe("PENDING");
+    await expectCancellationRetainsStock(order.id, product.variants[0].id, "Unclear reservation");
     expect(await stock(product.variants[0].id)).toBe(1);
-    expect(await movements(order.id, "CANCELLATION")).toHaveLength(0);
     // Do not allow an intentionally inconsistent due row to affect later batches.
     await db().stockReservation.updateMany({ where: { orderId: order.id }, data: { expiresAt: new Date("2100-01-01T00:00:00Z") } });
   });
@@ -728,10 +783,15 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     const codHold = await db().stockReservation.create({ data: { orderId: cod.order.id, variantId: cod.variantId, quantity: 1, expiresAt: new Date(0) } });
     const online = await sale(2, "sslcommerz");
     await db().stockReservation.updateMany({ where: { orderId: online.order.id }, data: { expiresAt: new Date(0) } });
-    await expect(cancelOrder(online.order.id, actor, "Unknown payment")).rejects.toThrow(/not proven failed/);
     expect((await expireEligibleReservations(actor)).expired).toBe(0);
     expect((await db().stockReservation.findUniqueOrThrow({ where: { id: codHold.id } })).releasedAt).toBeNull();
+    expect((await db().order.findUniqueOrThrow({ where: { id: online.order.id } })).status).toBe("PENDING");
     expect(await stock(online.variantId)).toBe(1);
+    // A separate uncertain order verifies manual cancellation without taking
+    // the first hold out of the subsequent terminal-expiry scenario.
+    const cancelledUnknown = await sale(2, "sslcommerz");
+    await expectCancellationRetainsStock(cancelledUnknown.order.id, cancelledUnknown.variantId, "Unknown payment");
+    expect(await stock(cancelledUnknown.variantId)).toBe(1);
     const payment = await db().paymentTransaction.findFirstOrThrow({ where: { orderId: online.order.id } });
     await processPaymentCallback("sslcommerz", { tran_id: payment.reference });
     const expired = await Promise.all([expireEligibleReservations(actor), expireEligibleReservations(actor)]);
@@ -830,6 +890,23 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     expect(await stock(online.variantId)).toBe(1);
   });
 
+  it("does not persist arbitrary callback bodies or event IDs before provider verification", async () => {
+    const unknown = `unknown-${randomUUID()}`;
+    await expect(processPaymentCallback("sslcommerz", { tran_id: unknown, val_id: "untrusted-secret" })).rejects.toThrow(/Unknown payment transaction/);
+    expect(mocks.verify).not.toHaveBeenCalled();
+    expect(await db().webhookEvent.findUnique({ where: { provider_eventId: { provider: "sslcommerz", eventId: unknown } } })).toBeNull();
+
+    const online = await sale(2, "sslcommerz");
+    const payment = await db().paymentTransaction.findFirstOrThrow({ where: { orderId: online.order.id } });
+    mocks.verify.mockResolvedValue({ status: "PAID", reference: payment.reference, amount: payment.amount, currency: payment.currency, raw: {} });
+    expect(await processPaymentCallback("sslcommerz", { tran_id: payment.reference, val_id: "untrusted-secret-1" })).toMatchObject({ ok: true });
+    expect(await processPaymentCallback("sslcommerz", { tran_id: payment.reference, val_id: "untrusted-secret-2" })).toMatchObject({ ok: true, duplicate: true });
+    const events = await db().webhookEvent.findMany({ where: { provider: "sslcommerz", eventId: payment.reference! } });
+    expect(events).toHaveLength(1);
+    expect(events[0].payload).toEqual({ source: "provider-verification", status: "PAID" });
+    expect(JSON.stringify(events)).not.toContain("untrusted-secret");
+  });
+
   it("does not turn an unrecognized provider response into a paid order", async () => {
     const online = await sale(2, "sslcommerz");
     const payment = await db().paymentTransaction.findFirstOrThrow({ where: { orderId: online.order.id } });
@@ -847,7 +924,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     await expect(processPaymentCallback("sslcommerz", { tran_id: payment.reference })).rejects.toThrow(/cannot be replaced/);
     expect((await db().order.findUniqueOrThrow({ where: { id: online.order.id } })).paymentStatus).toBe("AUTHORIZED");
     expect((await db().paymentTransaction.findUniqueOrThrow({ where: { id: payment.id } })).status).toBe("INITIATED");
-    await expect(cancelOrder(online.order.id, actor, "Authorization is unresolved")).rejects.toThrow();
+    await expectCancellationRetainsStock(online.order.id, online.variantId, "Authorization is unresolved");
     expect(await stock(online.variantId)).toBe(1);
   });
 
@@ -968,7 +1045,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     expect(await movements(order.id, "CANCELLATION")).toHaveLength(1);
   });
 
-  it("serializes shipping against cancellation, allowing only the winning transition", async () => {
+  it.each(["cancellation", "shipping"] as const)("serializes shipping against cancellation with %s queued first", async (first) => {
     const { order, variantId } = await sale();
     await updateOrderStatus(order.id, "CONFIRMED", actor);
     await updateOrderStatus(order.id, "READY_TO_SHIP", actor);
@@ -980,20 +1057,38 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
       await release.promise;
     }, { timeout: 15_000 });
     await locked.promise;
-    const cancellation = cancelOrder(order.id, actor, "Race").then(() => null, (error: unknown) => error);
-    const shipping = updateOrderStatus(order.id, "SHIPPED", actor).then(() => null, (error: unknown) => error);
-    try { await waitForBlocked('FROM "Order"', 2); } finally { release.resolve(); }
+    const beginCancellation = () => cancelOrder(order.id, actor, "Race").then((value) => ({ value }), (error: unknown) => ({ error }));
+    const beginShipping = () => updateOrderStatus(order.id, "SHIPPED", actor).then((value) => ({ value }), (error: unknown) => ({ error }));
+    let cancellation: ReturnType<typeof beginCancellation>;
+    let shipping: ReturnType<typeof beginShipping>;
+    try {
+      if (first === "cancellation") {
+        cancellation = beginCancellation(); await waitForBlocked('FROM "Order"'); shipping = beginShipping();
+      } else {
+        shipping = beginShipping(); await waitForBlocked('FROM "Order"'); cancellation = beginCancellation();
+      }
+      await waitForBlocked('FROM "Order"', 2);
+    } finally { release.resolve(); }
     await blocker;
-    const results = await Promise.all([cancellation, shipping]);
-    expect(results.filter((result) => result === null)).toHaveLength(1);
+    const [cancelled, shipped] = await Promise.all([cancellation!, shipping!]);
     const current = await db().order.findUniqueOrThrow({ where: { id: order.id } });
-    if (current.status === "CANCELLED") {
+    expect(current.status).toBe("CANCELLED");
+    if (first === "cancellation") {
+      expect(cancelled).toEqual({ value: { changed: true, stockReleased: true } });
+      expect(shipped).toHaveProperty("error");
+      expect(current.cancellationStockReleasedAt).not.toBeNull();
+      expect(current.shippedAt).toBeNull();
       expect(await stock(variantId)).toBe(2);
       expect(await movements(order.id, "CANCELLATION")).toHaveLength(1);
+      expect(await db().orderStatusHistory.count({ where: { orderId: order.id, toStatus: "SHIPPED" } })).toBe(0);
     } else {
-      expect(current.status).toBe("SHIPPED");
+      expect(shipped).toHaveProperty("value");
+      expect(cancelled).toEqual({ value: { changed: true, stockReleased: false } });
+      expect(current.shippedAt).not.toBeNull();
+      expect(current.cancellationStockReleasedAt).toBeNull();
       expect(await stock(variantId)).toBe(1);
       expect(await movements(order.id, "CANCELLATION")).toHaveLength(0);
+      expect(await db().orderStatusHistory.count({ where: { orderId: order.id, toStatus: "SHIPPED" } })).toBe(1);
     }
   }, 20_000);
 
@@ -1050,30 +1145,32 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     const booking = bookCourierShipment(order.id, "fixture_courier", actor)
       .then((value) => ({ value }), (error: unknown) => ({ error }));
     await entered.promise;
-    let cancellation: unknown;
     try {
       const claim = await db().courierShipment.findFirstOrThrow({ where: { orderId: order.id } });
       expect(claim.status).toBe("PENDING");
       expect(claim.payload).toMatchObject({ landiqBooking: { state: "AWAITING_RESULT", sandbox: true } });
-      // Each of these must finish while the mocked network call is still held;
-      // otherwise the implementation is holding the order lock across I/O.
-      cancellation = await cancelOrder(order.id, actor, "Cancelled during courier booking").then(() => null, (error: unknown) => error);
+      // Each action finishes while the mocked network call is still held;
+      // the order lock must not be held across external I/O.
       await expect(updateOrderStatus(order.id, "SHIPPED", actor)).rejects.toThrow(/unresolved/);
       await expect(collectCod(order.id, order.total, actor)).rejects.toThrow(/unresolved/);
       await expect(bookCourierShipment(order.id, "fixture_courier", actor)).rejects.toThrow(/courier record/i);
       await expect(assignManualCourier({ orderId: order.id, courierName: "Another courier" }, actor)).rejects.toThrow(/courier record/i);
+      await expectCancellationRetainsStock(order.id, variantId, "Cancelled during courier booking");
       expect(mocks.createShipment).toHaveBeenCalledTimes(1);
     } finally { release.resolve(); }
     const shipment = await booking;
-    expect(shipment).toHaveProperty("value");
-    expect(cancellation).toBeInstanceOf(Error);
-    expect((await db().order.findUniqueOrThrow({ where: { id: order.id } })).status).not.toBe("CANCELLED");
-    expect((await db().courierShipment.findFirstOrThrow({ where: { orderId: order.id } })).status).toBe("BOOKED");
+    expect(shipment).toEqual({ error: expect.objectContaining({ message: expect.stringMatching(/order changed/i) }) });
+    const pending = await db().courierShipment.findFirstOrThrow({ where: { orderId: order.id } });
+    expect(pending.status).toBe("PENDING");
+    expect(pending.consignmentId).toBe("fixture-consignment");
+    expect(pending.trackingId).toBe("fixture-tracking");
+    expect(pending.payload).toMatchObject({ landiqBooking: { state: "RECONCILIATION_REQUIRED" } });
+    expect((await db().order.findUniqueOrThrow({ where: { id: order.id } })).status).toBe("CANCELLED");
     expect(await stock(variantId)).toBe(1);
     expect(await movements(order.id, "CANCELLATION")).toHaveLength(0);
   }, 20_000);
 
-  it("makes an exact manual assignment retry idempotent and blocks cancellation once assigned", async () => {
+  it("makes an exact manual assignment retry idempotent and retains stock on cancellation", async () => {
     const { order, variantId } = await sale();
     await readyForCourier(order.id);
     const input = { orderId: order.id, courierName: "Fixture courier", consignmentId: "manual-1", trackingId: "manual-track",
@@ -1084,7 +1181,8 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     expect(await db().courierTrackingEvent.count({ where: { shipmentId: first.id } })).toBe(1);
     expect(await db().auditLog.count({ where: { entityId: first.id, action: "MANUAL_COURIER_ASSIGN" } })).toBe(1);
     await expect(assignManualCourier({ ...input, courierName: "Different courier" }, actor)).rejects.toThrow(/courier record/i);
-    await expect(cancelOrder(order.id, actor, "Already assigned")).rejects.toThrow(/courier record/i);
+    await expectCancellationRetainsStock(order.id, variantId, "Already assigned");
+    expect((await db().courierShipment.findUniqueOrThrow({ where: { id: first.id } })).status).toBe("BOOKED");
     expect(await stock(variantId)).toBe(1);
     expect(await movements(order.id, "CANCELLATION")).toHaveLength(0);
   });
@@ -1115,10 +1213,14 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     await updateOrderStatus(order.id, "SHIPPED", actor);
     const request = await createReturnRequest({ orderId: order.id, reason: "Damaged item" }, actor);
     await updateReturnStatus(request.id, "APPROVED", actor);
+    const item = await db().orderItem.findFirstOrThrow({ where: { orderId: order.id } });
+    const receipt = await receiveItem(request.id, item.id);
+    expect(await stock(variantId)).toBe(1);
+    await inspectReturnReceipt({ receiptId: receipt.id, sellableQuantity: 1, damagedQuantity: 0 }, actor);
     await updateReturnStatus(request.id, "INSPECTED", actor);
     await updateReturnStatus(request.id, "RESTOCKED", actor);
     expect(await stock(variantId)).toBe(2);
-    expect(await movements(order.id, "RETURN")).toHaveLength(1);
+    expect((await movements(order.id, "RETURN")).map((movement) => movement.returnReceiptId)).toEqual([receipt.id]);
   });
 
   it("does not call a courier if cancellation queued first wins the order lock", async () => {
@@ -1159,7 +1261,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     expect(mocks.createShipment.mock.calls[0][0].codAmount).toBe(order.total);
     expect(await db().courierShipment.count({ where: { orderId: order.id } })).toBe(1);
     expect(await db().auditLog.count({ where: { entityId: first.id, action: "COURIER_BOOKED" } })).toBe(1);
-    await expect(cancelOrder(order.id, actor, "Already booked")).rejects.toThrow(/courier record/i);
+    await expectCancellationRetainsStock(order.id, variantId, "Already booked");
     expect(await stock(variantId)).toBe(1);
   });
 
@@ -1171,7 +1273,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     const marker = (shipment.payload as unknown as { landiqBooking: Record<string, string | number | boolean> }).landiqBooking;
     await db().courierShipment.update({ where: { id: shipment.id }, data: { payload: { landiqBooking: { ...marker, version } } } });
     await expect(bookCourierShipment(order.id, "fixture_courier", actor)).rejects.toThrow(/courier record.*reconciliation/i);
-    await expect(cancelOrder(order.id, actor, "Legacy marker")).rejects.toThrow(/courier record/i);
+    await expectCancellationRetainsStock(order.id, variantId, "Legacy marker");
     expect(mocks.createShipment).toHaveBeenCalledTimes(1);
     expect(await stock(variantId)).toBe(1);
   });
@@ -1256,16 +1358,20 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
       entered.resolve(); await release.promise;
       return { consignmentId: "delayed-c", trackingId: "delayed-t", raw: {} };
     });
-    const booking = bookCourierShipment(order.id, "fixture_courier", actor);
+    const booking = bookCourierShipment(order.id, "fixture_courier", actor).then(() => null, (error: unknown) => error);
     await entered.promise;
     try {
       await db().courierShipment.updateMany({ where: { orderId: order.id }, data: { createdAt: new Date("2000-01-01") } });
       await expect(bookCourierShipment(order.id, "fixture_courier", actor)).rejects.toThrow(/courier record/i);
-      await expect(cancelOrder(order.id, actor, "Old claim")).rejects.toThrow(/courier record/i);
+      await expectCancellationRetainsStock(order.id, variantId, "Old claim");
       expect(mocks.createShipment).toHaveBeenCalledTimes(1);
       expect(await stock(variantId)).toBe(1);
     } finally { release.resolve(); }
-    expect((await booking).status).toBe("BOOKED");
+    expect(await booking).toEqual(expect.objectContaining({ message: expect.stringMatching(/order changed/i) }));
+    const claim = await db().courierShipment.findFirstOrThrow({ where: { orderId: order.id } });
+    expect(claim.status).toBe("PENDING");
+    expect(claim.payload).toMatchObject({ landiqBooking: { state: "RECONCILIATION_REQUIRED" } });
+    expect(claim.consignmentId).toBe("delayed-c");
     expect(await db().courierShipment.count({ where: { orderId: order.id } })).toBe(1);
     expect(await movements(order.id, "CANCELLATION")).toHaveLength(0);
   }, 20_000);
@@ -1292,7 +1398,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     expect(await db().courierTrackingEvent.count({ where: { shipmentId: resultShipment.id, status: "BOOKED" } })).toBe(1);
     expect(await db().auditLog.count({ where: { entityId: resultShipment.id, action: "COURIER_BOOKED" } })).toBe(1);
     expect(mocks.createShipment).toHaveBeenCalledTimes(1);
-    await expect(cancelOrder(order.id, actor, "Booked")).rejects.toThrow(/courier record/i);
+    await expectCancellationRetainsStock(order.id, variantId, "Booked");
     expect(await stock(variantId)).toBe(1);
   }, 20_000);
 
@@ -1315,9 +1421,14 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
       expect(pending.consignmentId).toBe("first-c");
       expect(pending.payload).toMatchObject({ landiqBooking: { state: "RECONCILIATION_REQUIRED" },
         providerResponse: { provider: "first" }, conflictingProviderResult: { consignmentId: "second-c", trackingId: "second-t" } });
-      await expect(cancelOrder(order.id, actor, "Conflicting responses")).rejects.toThrow(/courier record/i);
+      await expectCancellationRetainsStock(order.id, variantId, "Conflicting responses");
     } finally { release.resolve(); }
-    expect(await booking).toEqual(expect.objectContaining({ message: expect.stringMatching(/may have been created/) }));
+    expect(await booking).toEqual(expect.objectContaining({ message: expect.stringMatching(/order changed/i) }));
+    const retained = await db().courierShipment.findFirstOrThrow({ where: { orderId: order.id } });
+    expect(retained.status).toBe("PENDING");
+    expect(retained.consignmentId).toBe("first-c");
+    expect(retained.payload).toMatchObject({ landiqBooking: { state: "RECONCILIATION_REQUIRED" },
+      providerResponse: { provider: "first" }, conflictingProviderResult: { consignmentId: "second-c", trackingId: "second-t" } });
     expect(mocks.createShipment).toHaveBeenCalledTimes(1);
     expect(await stock(variantId)).toBe(1);
     expect(await movements(order.id, "CANCELLATION")).toHaveLength(0);
@@ -1349,7 +1460,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
       expect(claim.status).toBe("PENDING");
       expect(claim.payload).toMatchObject({ landiqBooking: { state: "RECONCILIATION_REQUIRED" } });
       expect(claim.consignmentId).toBe("config-c");
-      await expect(cancelOrder(order.id, actor, "Configuration changed")).rejects.toThrow(/courier record/i);
+      await expectCancellationRetainsStock(order.id, variantId, "Configuration changed");
       expect(await stock(variantId)).toBe(1);
     } finally {
       await db().courierProviderConfiguration.update({ where: { id: original.id }, data: {
@@ -1386,7 +1497,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
           expect(result).toEqual(expect.objectContaining({ status: "BOOKED" }));
           expect(claim.status).toBe("BOOKED");
         }
-        await expect(cancelOrder(order.id, actor, "Endpoint snapshot")).rejects.toThrow(/courier record/i);
+        await expectCancellationRetainsStock(order.id, variantId, "Endpoint snapshot");
         expect(await stock(variantId)).toBe(1);
         expect(mocks.createShipment).toHaveBeenCalledTimes(1);
       } finally { release.resolve(); await booking; vi.unstubAllEnvs(); }
@@ -1456,7 +1567,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     await expect(bookCourierShipment(order.id, "fixture_courier", actor)).rejects.toThrow(/courier record/i);
     await expect(syncCourierTracking(claim.id, actor)).rejects.toThrow(/unresolved/);
     await expect(updateOrderStatus(order.id, "SHIPPED", actor)).rejects.toThrow(/unresolved/);
-    await expect(cancelOrder(order.id, actor, "Unknown provider outcome")).rejects.toThrow(/courier record/i);
+    await expectCancellationRetainsStock(order.id, variantId, "Unknown provider outcome");
     expect(mocks.createShipment).toHaveBeenCalledTimes(1);
     expect(await stock(variantId)).toBe(1);
     expect(await movements(order.id, "CANCELLATION")).toHaveLength(0);
@@ -1475,7 +1586,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     const claim = await db().courierShipment.findFirstOrThrow({ where: { orderId: order.id } });
     expect(claim.status).toBe("PENDING");
     expect(claim.payload).toMatchObject({ landiqBooking: { state: "OUTCOME_UNKNOWN" } });
-    await expect(cancelOrder(order.id, actor, "Bad provider response")).rejects.toThrow(/courier record/i);
+    await expectCancellationRetainsStock(order.id, variantId, "Bad provider response");
     expect(await stock(variantId)).toBe(1);
   });
 
@@ -1501,7 +1612,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     expect(claim.consignmentId).toBe("known-consignment");
     expect(claim.trackingId).toBe("known-tracking");
     expect(claim.payload).toMatchObject({ landiqBooking: { state: "RECONCILIATION_REQUIRED" }, providerResponse: { accepted: true } });
-    await expect(cancelOrder(order.id, actor, "Changed order")).rejects.toThrow(/courier record/i);
+    await expectCancellationRetainsStock(order.id, variantId, "Changed order");
     expect(await stock(variantId)).toBe(1);
   });
 
@@ -1561,17 +1672,25 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     expect(mocks.createShipment).toHaveBeenCalledTimes(1);
   }, 20_000);
 
-  it.each(["PENDING", "FAILED", "CANCELLED"] as const)("blocks return creation and restocking for ambiguous legacy %s courier records", async (status) => {
+  it.each(["PENDING", "FAILED", "CANCELLED"] as const)("does not treat an ambiguous legacy %s courier status as a physical return", async (status) => {
     const { order, variantId } = await sale();
     await ship(order.id);
+    const shipment = await db().courierShipment.create({ data: { orderId: order.id, providerCode: "legacy", status, createdById: actor } });
     const request = await createReturnRequest({ orderId: order.id, reason: "Damaged item" }, actor);
     await updateReturnStatus(request.id, "APPROVED", actor);
-    await updateReturnStatus(request.id, "INSPECTED", actor);
-    await db().courierShipment.create({ data: { orderId: order.id, providerCode: "legacy", status, createdById: actor } });
-    await expect(createReturnRequest({ orderId: order.id, reason: "Another reason" }, actor)).rejects.toThrow(/unresolved/);
-    await expect(updateReturnStatus(request.id, "RESTOCKED", actor)).rejects.toThrow(/unresolved/);
+    await expect(createReturnRequest({ orderId: order.id, reason: "Another reason" }, actor)).rejects.toThrow(/open return/);
+    await expect(updateReturnStatus(request.id, "INSPECTED", actor)).rejects.toThrow(/Record and inspect/);
     expect(await stock(variantId)).toBe(1);
     expect(await movements(order.id, "RETURN")).toHaveLength(0);
+    const item = await db().orderItem.findFirstOrThrow({ where: { orderId: order.id } });
+    const receipt = await receiveItem(request.id, item.id);
+    expect(await stock(variantId)).toBe(1);
+    await inspectReturnReceipt({ receiptId: receipt.id, sellableQuantity: 1, damagedQuantity: 0 }, actor);
+    await updateReturnStatus(request.id, "INSPECTED", actor);
+    await updateReturnStatus(request.id, "RESTOCKED", actor);
+    expect(await stock(variantId)).toBe(2);
+    expect((await movements(order.id, "RETURN")).map((movement) => [movement.quantity, movement.returnReceiptId])).toEqual([[1, receipt.id]]);
+    expect((await db().courierShipment.findUniqueOrThrow({ where: { id: shipment.id } })).status).toBe(status);
   });
 
   it("records a paid callback for reconciliation instead of confirming a legacy pending courier claim", async () => {
@@ -1606,7 +1725,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     expect(claim.trackingId).toBe("reported-tracking");
     expect(claim.payload).toMatchObject({ landiqBooking: { state: "RECONCILIATION_REQUIRED" }, providerResponse: { accepted: true } });
     await expect(bookCourierShipment(order.id, "fixture_courier", actor)).rejects.toThrow(/courier record/i);
-    await expect(cancelOrder(order.id, actor, "Local write failure")).rejects.toThrow(/courier record/i);
+    await expectCancellationRetainsStock(order.id, variantId, "Local write failure");
     expect(mocks.createShipment).toHaveBeenCalledTimes(1);
     expect(await stock(variantId)).toBe(1);
   });
@@ -1652,7 +1771,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
       await expect(bookCourierShipment(order.id, "fixture_courier", actor)).rejects.toThrow(/courier record/i);
       await expect(assignManualCourier({ orderId: order.id, courierName: "Replacement" }, actor)).rejects.toThrow(/courier record/i);
       await expect(updateOrderStatus(order.id, "SHIPPED", actor)).rejects.toThrow(/unresolved/);
-      await expect(cancelOrder(order.id, actor, "Process was killed")).rejects.toThrow(/courier record/i);
+      await expectCancellationRetainsStock(order.id, variantId, "Process was killed");
       expect(mocks.createShipment).not.toHaveBeenCalled();
       expect(await stock(variantId)).toBe(1);
       expect(await movements(order.id, "CANCELLATION")).toHaveLength(0);
@@ -1757,7 +1876,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     await recordRefund({ ...input, amount: 200, reason: "Remaining balance", idempotencyKey: randomUUID() }, actor);
     expect((await db().order.findUniqueOrThrow({ where: { id: order.id } })).financialStatus).toBe("REFUNDED");
     expect(await stock(variantId)).toBe(1);
-    await expect(cancelOrder(order.id, actor, "Refunded")).rejects.toThrow();
+    await expectCancellationRetainsStock(order.id, variantId, "Refunded");
   });
 
   it("serializes two different partial refunds against the paid balance", async () => {
@@ -1773,7 +1892,9 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     expect(await movements(order.id, "CANCELLATION")).toHaveLength(0);
   });
 
-  it.each(["unpaid", "collected"] as const)("serializes cancellation against a %s COD refund", async (paymentState) => {
+  it.each((["unpaid", "collected"] as const).flatMap((paymentState) =>
+    (["cancellation", "refund"] as const).map((first) => ({ paymentState, first }))))(
+    "serializes a $paymentState COD refund against cancellation with $first queued first", async ({ paymentState, first }) => {
     const { order, variantId } = await sale();
     if (paymentState === "collected") await collectCod(order.id, order.total, actor);
     const locked = deferred();
@@ -1783,23 +1904,44 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
       locked.resolve(); await release.promise;
     }, { timeout: 15_000 });
     await locked.promise;
-    const cancellation = cancelOrder(order.id, actor, "Refund race").then(() => null, (error: unknown) => error);
-    const refund = recordRefund({ orderId: order.id, amount: 300, reason: "Refund race", idempotencyKey: randomUUID() }, actor)
-      .then(() => null, (error: unknown) => error);
-    try { await waitForBlocked('FROM "Order"', 2); } finally { release.resolve(); }
+    const beginCancellation = () => cancelOrder(order.id, actor, "Refund race").then((value) => ({ value }), (error: unknown) => ({ error }));
+    const beginRefund = () => recordRefund({ orderId: order.id, amount: 300, reason: "Refund race", idempotencyKey: randomUUID() }, actor)
+      .then((value) => ({ value }), (error: unknown) => ({ error }));
+    let cancellation: ReturnType<typeof beginCancellation>;
+    let refund: ReturnType<typeof beginRefund>;
+    try {
+      if (first === "cancellation") {
+        cancellation = beginCancellation(); await waitForBlocked('FROM "Order"'); refund = beginRefund();
+      } else {
+        refund = beginRefund(); await waitForBlocked('FROM "Order"'); cancellation = beginCancellation();
+      }
+      await waitForBlocked('FROM "Order"', 2);
+    } finally { release.resolve(); }
     await blocker;
-    const [cancelError, refundError] = await Promise.all([cancellation, refund]);
+    const [cancelled, refunded] = await Promise.all([cancellation!, refund!]);
     const current = await db().order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(current.status).toBe("CANCELLED");
     if (paymentState === "unpaid") {
-      expect(cancelError).toBeNull(); expect(refundError).toBeInstanceOf(Error);
-      expect(current.status).toBe("CANCELLED"); expect(await stock(variantId)).toBe(2);
+      expect(cancelled).toEqual({ value: { changed: true, stockReleased: true } });
+      expect(refunded).toHaveProperty("error");
+      expect(current.paymentStatus).toBe("COD_PENDING");
+      expect(await stock(variantId)).toBe(2);
       expect(await db().refund.count({ where: { orderId: order.id } })).toBe(0);
       expect(await movements(order.id, "CANCELLATION")).toHaveLength(1);
     } else {
-      expect(cancelError).toBeInstanceOf(Error); expect(refundError).toBeNull();
-      expect(current.status).toBe("PENDING"); expect(await stock(variantId)).toBe(1);
-      expect(await db().refund.count({ where: { orderId: order.id } })).toBe(1);
-      expect(await movements(order.id, "CANCELLATION")).toHaveLength(0);
+      expect(refunded).toHaveProperty("value");
+      expect(current.paymentStatus).toBe("COD_COLLECTED");
+      expect(current.financialStatus).toBe("PARTIALLY_SETTLED");
+      expect(await db().refund.count({ where: { orderId: order.id, status: "RECORDED" } })).toBe(1);
+      // A prior refund makes release ambiguous; cancellation first may release
+      // undispatched stock but cannot erase the separately recorded refund.
+      const released = first === "cancellation";
+      expect(cancelled).toEqual({ value: { changed: true, stockReleased: released } });
+      expect(Boolean(current.cancellationStockReleasedAt)).toBe(released);
+      expect(await stock(variantId)).toBe(released ? 2 : 1);
+      expect(await movements(order.id, "CANCELLATION")).toHaveLength(released ? 1 : 0);
+      expect(await cancelOrder(order.id, actor, "Retry")).toEqual({ changed: false, stockReleased: released });
+      expect(await stock(variantId)).toBe(released ? 2 : 1);
     }
   }, 20_000);
 
@@ -1822,7 +1964,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
       await expect(executeProviderRefund({ ...input, idempotencyKey: randomUUID() }, actor)).rejects.toThrow(/unresolved/);
       await expect(recordRefund({ orderId: order.id, amount: 100, reason: "Other", idempotencyKey: randomUUID() }, actor)).rejects.toThrow(/unresolved/);
       await expect(updateOrderStatus(order.id, "SHIPPED", actor)).rejects.toThrow(/refund.*reconciliation/i);
-      await expect(cancelOrder(order.id, actor, "Refund pending")).rejects.toThrow();
+      await expectCancellationRetainsStock(order.id, variantId, "Refund pending");
       expect(await stock(variantId)).toBe(1);
       expect(mocks.refund).toHaveBeenCalledTimes(1);
     } finally { release.resolve(); }
@@ -1869,25 +2011,34 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     expect((await db().order.findUniqueOrThrow({ where: { id: order.id } })).financialStatus).toBe("PARTIALLY_SETTLED");
   });
 
-  it("does not restock an inspected return while its provider refund is unresolved", async () => {
+  it("keeps physical inspection separate from an unresolved provider refund", async () => {
     const { order, payment, variantId } = await paidOnline();
     await updateOrderStatus(order.id, "PROCESSING", actor);
     await updateOrderStatus(order.id, "SHIPPED", actor);
     const request = await createReturnRequest({ orderId: order.id, reason: "Damaged item" }, actor);
     await updateReturnStatus(request.id, "APPROVED", actor);
-    await updateReturnStatus(request.id, "INSPECTED", actor);
+    const item = await db().orderItem.findFirstOrThrow({ where: { orderId: order.id } });
+    const receipt = await receiveItem(request.id, item.id);
     const entered = deferred(); const release = deferred();
     mocks.refund.mockImplementation(async () => { entered.resolve(); await release.promise; return { status: "PENDING" }; });
     const refund = executeProviderRefund({ orderId: order.id, transactionId: payment.id, amount: 200,
       reason: "Refund return", idempotencyKey: randomUUID() }, actor);
     await entered.promise;
     try {
-      await expect(updateReturnStatus(request.id, "RESTOCKED", actor)).rejects.toThrow(/refund outcome is unresolved/i);
+      await expect(updateReturnStatus(request.id, "INSPECTED", actor)).rejects.toThrow(/Record and inspect/);
       expect(await stock(variantId)).toBe(1);
+      expect(await movements(order.id, "RETURN")).toHaveLength(0);
+      await inspectReturnReceipt({ receiptId: receipt.id, sellableQuantity: 1, damagedQuantity: 0 }, actor);
+      await updateReturnStatus(request.id, "INSPECTED", actor);
+      await updateReturnStatus(request.id, "RESTOCKED", actor);
+      await expect(updateReturnStatus(request.id, "REFUNDED", actor)).rejects.toThrow(/Record a refund/);
+      expect((await db().refund.findFirstOrThrow({ where: { orderId: order.id } })).status).toBe("AWAITING_PROVIDER");
+      expect(await stock(variantId)).toBe(2);
     } finally { release.resolve(); }
     expect((await refund).status).toBe("RECONCILIATION_REQUIRED");
-    await expect(updateReturnStatus(request.id, "RESTOCKED", actor)).rejects.toThrow(/refund outcome is unresolved/i);
-    expect(await movements(order.id, "RETURN")).toHaveLength(0);
+    await expect(updateReturnStatus(request.id, "REFUNDED", actor)).rejects.toThrow(/Record a refund/);
+    expect((await movements(order.id, "RETURN")).map((movement) => movement.returnReceiptId)).toEqual([receipt.id]);
+    expect(await stock(variantId)).toBe(2);
   }, 20_000);
 
   it("records a refund for a late verified capture without reopening or re-restoring a cancelled order", async () => {
@@ -1905,7 +2056,7 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
     expect(await movements(order.id, "CANCELLATION")).toHaveLength(1);
   });
 
-  it("serializes COD collection against cancellation, so stock restoration and collection cannot both win", async () => {
+  it.each(["cancellation", "collection"] as const)("serializes COD collection and cancellation with %s queued first", async (first) => {
     const { order, variantId } = await sale();
     const locked = deferred();
     const release = deferred();
@@ -1915,19 +2066,40 @@ describe.skipIf(!enabled)("inventory and order integrity on a verified disposabl
       await release.promise;
     }, { timeout: 15_000 });
     await locked.promise;
-    const cancellation = cancelOrder(order.id, actor, "Race").then(() => null, (error: unknown) => error);
-    const collection = collectCod(order.id, order.total, actor).then(() => null, (error: unknown) => error);
-    try { await waitForBlocked('FROM "Order"', 2); } finally { release.resolve(); }
+    const beginCancellation = () => cancelOrder(order.id, actor, "Race").then((value) => ({ value }), (error: unknown) => ({ error }));
+    const beginCollection = () => collectCod(order.id, order.total, actor).then((value) => ({ value }), (error: unknown) => ({ error }));
+    let cancellation: ReturnType<typeof beginCancellation>;
+    let collection: ReturnType<typeof beginCollection>;
+    try {
+      if (first === "cancellation") {
+        cancellation = beginCancellation(); await waitForBlocked('FROM "Order"'); collection = beginCollection();
+      } else {
+        collection = beginCollection(); await waitForBlocked('FROM "Order"'); cancellation = beginCancellation();
+      }
+      await waitForBlocked('FROM "Order"', 2);
+    } finally { release.resolve(); }
     await blocker;
-    const results = await Promise.all([cancellation, collection]);
-    expect(results.filter((result) => result === null)).toHaveLength(1);
+    const [cancelled, collected] = await Promise.all([cancellation!, collection!]);
+    expect(cancelled).toEqual({ value: { changed: true, stockReleased: true } });
     const current = await db().order.findUniqueOrThrow({ where: { id: order.id } });
-    if (current.status === "CANCELLED") {
+    expect(current.status).toBe("CANCELLED");
+    if (first === "cancellation") {
+      expect(collected).toHaveProperty("error");
       expect(current.paymentStatus).toBe("COD_PENDING");
-      expect(await stock(variantId)).toBe(2);
     } else {
+      expect(collected).toHaveProperty("value");
+      // Collection can precede an undispatched manager cancellation. It is
+      // still owed to the customer; cancellation is not a refund or payout.
       expect(current.paymentStatus).toBe("COD_COLLECTED");
-      expect(await stock(variantId)).toBe(1);
+      expect(current.financialStatus).toBe("PARTIALLY_SETTLED");
+      expect(current.codCollectedAt).not.toBeNull();
+      expect(await db().refund.count({ where: { orderId: order.id } })).toBe(0);
     }
+    expect(current.cancellationStockReleasedAt).not.toBeNull();
+    expect(await stock(variantId)).toBe(2);
+    expect(await movements(order.id, "CANCELLATION")).toHaveLength(1);
+    await expect(collectCod(order.id, order.total, actor)).rejects.toThrow(/closed order/);
+    expect(await cancelOrder(order.id, actor, "Retry")).toEqual({ changed: false, stockReleased: true });
+    expect(await stock(variantId)).toBe(2);
   }, 20_000);
 });

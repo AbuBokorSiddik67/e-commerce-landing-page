@@ -3,6 +3,11 @@ import { PrismaClient } from "@prisma/client";
 export const prisma = new PrismaClient();
 
 export async function resetDatabase() {
+  // These historical suites truncate every application table. They are not
+  // part of npm test; never opt in unless DATABASE_URL is a disposable test DB.
+  if (process.env.LANDIQ_ALLOW_DESTRUCTIVE_TEST_DB !== "1") {
+    throw new Error("Refusing destructive reset: use the identity-verified disposable suites instead");
+  }
   const rows = await prisma.$queryRaw<Array<{ tablename: string }>>`
     SELECT tablename FROM pg_tables WHERE schemaname = 'public' AND tablename NOT LIKE '\_prisma%'
   `;

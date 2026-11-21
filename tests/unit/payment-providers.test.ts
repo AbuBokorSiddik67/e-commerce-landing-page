@@ -45,6 +45,20 @@ describe("payment provider adapters", () => {
     expect(result.reference).toBe("PID1");
   });
 
+  it("does not reuse a bKash token after account password, username or environment changes", async () => {
+    const mock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ id_token: "fixture-token" }), { status: 200 }));
+    // Each call must have a fresh Response body.
+    mock.mockImplementation(async () => new Response(JSON.stringify({ id_token: "fixture-token" }), { status: 200 }));
+    vi.stubGlobal("fetch", mock);
+    const account = { appKey: "fixture-cache-key", appSecret: "fixture-cache-secret", username: "fixture-user-A", password: "fixture-password-A" };
+    await bkashProvider.testConnection(account, true);
+    await bkashProvider.testConnection(account, true);
+    await bkashProvider.testConnection({ ...account, username: "fixture-user-B" }, true);
+    await bkashProvider.testConnection({ ...account, password: "fixture-password-B" }, true);
+    await bkashProvider.testConnection(account, false);
+    expect(mock).toHaveBeenCalledTimes(4);
+  });
+
   it("exposes a pluggable provider registry", () => {
     expect(getPaymentProvider("cod")).toBeNull();
     expect(getPaymentProvider("bkash")?.code).toBe("bkash");

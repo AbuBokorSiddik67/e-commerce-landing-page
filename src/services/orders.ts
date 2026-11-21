@@ -5,6 +5,7 @@ import type { CourierProviderConfiguration, CourierShipment, Order, OrderStatus,
 import { prisma } from "@/lib/prisma";
 import { ConflictError, NotFoundError } from "@/lib/errors";
 import { orderNumber, randomToken } from "@/lib/crypto";
+import { siteUrl } from "@/lib/config";
 import { addressSchema, emailSchema, nameSchema, phoneSchema } from "@/lib/validation";
 import { lineTotals, validateCoupon } from "@/lib/pricing";
 import { normalizeStoredVariantAttributes } from "@/lib/product-attributes";
@@ -280,8 +281,9 @@ async function placeNewOrder(input: ParsedCheckout, operation: CheckoutOperation
       orderId: order.id, email: input.customer.email || null, phone: input.customer.phone,
       channels: ["IN_APP", "EMAIL", "SMS"],
     });
-  } catch (error) {
-    console.error("Order committed but notification failed", { orderId: order.id, error });
+  } catch {
+    // Delivery exceptions can contain addresses, tokens or provider payloads.
+    console.error("Order committed but notification failed", { orderId: order.id });
   }
 
   if (input.paymentMethod === "cod") {
@@ -290,7 +292,7 @@ async function placeNewOrder(input: ParsedCheckout, operation: CheckoutOperation
 
   const provider = getPaymentProvider(input.paymentMethod);
   if (!provider) throw new ConflictError("Unknown payment provider");
-  const baseUrl = (process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000").replace(/\/$/, "");
+  const baseUrl = siteUrl();
   let providerCalled = false;
   try {
     const credentials = await getPaymentCredential(input.paymentMethod);
@@ -344,9 +346,11 @@ async function placeNewOrder(input: ParsedCheckout, operation: CheckoutOperation
         data: { status: providerCalled ? "INITIALIZATION_UNKNOWN" : "INITIALIZATION_NOT_STARTED" },
       });
     } catch (recordError) {
-      console.error("Could not record uncertain payment initialization", { orderId: order.id, error: recordError });
+      console.error("Could not record uncertain payment initialization", { orderId: order.id,
+        errorType: recordError instanceof Error ? recordError.name : "UnknownError" });
     }
-    console.error("Payment initialization requires reconciliation", { orderId: order.id, error });
+    console.error("Payment initialization requires reconciliation", { orderId: order.id,
+      errorType: error instanceof Error ? error.name : "UnknownError" });
     throw new ConflictError(`Payment could not be started reliably. Order ${order.orderNumber} is reserved for staff reconciliation; do not place it again until checked.`);
   }
 }
@@ -538,8 +542,8 @@ export async function cancelOrder(orderId: string, actorId: string, reason: stri
         type: "ORDER_CANCELLED", title: "Order cancelled", body: `Order ${result.order.orderNumber} was cancelled. ${cleanReason}`,
         orderId, channels: ["IN_APP", "EMAIL", "SMS"],
       });
-    } catch (error) {
-      console.error("Cancellation committed but notification failed", { orderId, error });
+    } catch {
+      console.error("Cancellation committed but notification failed", { orderId });
     }
   }
   return { changed: result.changed, stockReleased: result.stockReleased };
@@ -662,8 +666,8 @@ export async function updateOrderStatus(orderId: string, status: OrderStatus, ac
         body: `Order ${result.order.orderNumber} is now ${STATUS_LABELS[status]}.`,
         orderId, customerId: result.order.customerId, channels: ["IN_APP", "EMAIL", "SMS"],
       });
-    } catch (error) {
-      console.error("Order status committed but notification failed", { orderId, error });
+    } catch {
+      console.error("Order status committed but notification failed", { orderId });
     }
   }
   return result.order;
@@ -674,13 +678,6 @@ export async function processPaymentCallback(providerCode: string, payload: Reco
   if (!provider) throw new ConflictError("Unknown payment provider");
   const transactionRef = String(payload.paymentID ?? payload.tran_id ?? payload.tranId ?? payload.paymentRefId ?? payload.trxID ?? "");
   if (!transactionRef) throw new ConflictError("Callback is missing a transaction reference");
-  const eventId = String(payload.val_id ?? payload.trxID ?? payload.paymentRefId ?? transactionRef);
-  await prisma.webhookEvent.upsert({
-    where: { provider_eventId: { provider: providerCode, eventId } },
-    create: { provider: providerCode, eventId, payload: payload as never },
-    update: {},
-  });
-
   const config = await prisma.paymentMethodConfiguration.findUnique({ where: { code: providerCode } });
   if (!config?.enabled) throw new ConflictError("Payment provider is disabled");
   // The request identifier is only a locator. It cannot establish success;
@@ -701,6 +698,14 @@ export async function processPaymentCallback(providerCode: string, payload: Reco
   if (!verification.reference || verification.reference !== transactionRef) {
     throw new ConflictError("The provider did not verify this transaction reference");
   }
+  // Never persist an arbitrary unauthenticated callback body or attacker-chosen
+  // event IDs. Record at most one event per known, provider-verified reference.
+  // Payment state/idempotency is still decided under the order lock below.
+  await prisma.webhookEvent.upsert({
+    where: { provider_eventId: { provider: providerCode, eventId: transactionRef } },
+    create: { provider: providerCode, eventId: transactionRef, payload: { source: "provider-verification", status: verification.status } },
+    update: {},
+  });
   if (verification.status === "PAID" && (typeof verification.amount !== "number" || !Number.isSafeInteger(verification.amount) || verification.amount <= 0
     || verification.amount !== transaction.amount || !verification.currency || verification.currency !== transaction.currency)) {
     await prisma.paymentAttempt.create({ data: { orderId: transaction.orderId, provider: providerCode, status: "VERIFICATION_MISMATCH", response: verification.raw as never } });
@@ -802,8 +807,8 @@ export async function processPaymentCallback(providerCode: string, payload: Reco
         name: "Purchase", orderId: transaction.orderId, value: transaction.amount,
         currency: transaction.currency, visitorId: "server", email: null, phone: null,
       });
-    } catch (error) {
-      console.error("Payment committed but post-payment delivery failed", { orderId: transaction.orderId, error });
+    } catch {
+      console.error("Payment committed but post-payment delivery failed", { orderId: transaction.orderId });
     }
   }
   return { ok: result.ok, duplicate: result.duplicate, orderNumber: result.orderNumber, requiresReconciliation: result.reconcile };
@@ -812,9 +817,9 @@ export async function processPaymentCallback(providerCode: string, payload: Reco
 // Store provider JSON without coercion or unsafe casts. A malformed response
 // cannot be treated as a confirmed booking; the durable claim stays pending.
 const jsonValueSchema: z.ZodType<Prisma.JsonValue> = z.lazy(() => z.union([
-  z.string(), z.number().finite(), z.boolean(), z.null(), z.array(jsonValueSchema), z.record(jsonValueSchema),
+  z.string(), z.number().finite(), z.boolean(), z.null(), z.array(jsonValueSchema), z.record(z.string(), jsonValueSchema),
 ]));
-const courierRawSchema = z.record(jsonValueSchema);
+const courierRawSchema = z.record(z.string(), jsonValueSchema);
 const nonBlankReference = z.string().max(512).refine((value) => value.trim().length > 0);
 const courierBookingSchema = z.object({
   consignmentId: nonBlankReference,
@@ -887,7 +892,9 @@ export function courierConfigurationMac(config: CourierProviderConfiguration, cr
   // the provider account, environment and endpoint override. Production already
   // requires this secret for credential encryption; rotation fails closed.
   const key = process.env.CREDENTIALS_ENCRYPTION_KEY;
-  if (!key && process.env.NODE_ENV === "production") throw new ConflictError("Courier configuration key is unavailable");
+  if (process.env.NODE_ENV === "production" && (!key || Buffer.byteLength(key, "utf8") < 32)) {
+    throw new ConflictError("Courier configuration key is unavailable or too short");
+  }
   return createHmac("sha256", key ?? "landiq-development-only-key").update(JSON.stringify(canonical({
     domain: "landiq-courier-config-v1", id: config.id, code: config.code, enabled: config.enabled, sandbox: config.sandbox,
     settings: config.settings, storedCredentials: config.credentials, credentials,

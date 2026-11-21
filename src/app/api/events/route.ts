@@ -11,7 +11,7 @@ const schema = z.object({
   pageId: z.string().max(60).optional(),
   productId: z.string().max(60).optional(),
   visitorId: z.string().min(4).max(100),
-  metadata: z.record(z.string()).optional(),
+  metadata: z.record(z.string(), z.string()).optional(),
 });
 
 export async function POST(request: Request) {

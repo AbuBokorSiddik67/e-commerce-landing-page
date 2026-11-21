@@ -1,6 +1,6 @@
 # Phase 1 order, delivery and inventory schema proposal
 
-**PROPOSAL ONLY — NOT A MIGRATION, NOT EXECUTED.** No existing migration is edited. This is a review draft for the current single pre-production codebase and database; it is not an instruction to run SQL. Obtain separate approval before generating, reviewing, or applying a migration. Do not use `db push`, reset, seed, or an unidentified database.
+**Historical proposal, not an instruction to run SQL.** The illustrative DDL below was subsequently extracted into the new additive migration `prisma/migrations/20261120060000_phase1_order_inventory/migration.sql`. Its SQL has been exercised on synthetic, identity-verified disposable PostgreSQL databases and compared with a generated current-schema fixture. The official Prisma migration CLI, existing installation history/data, cutover and rollback have **not** been verified. Review [current deployment blockers](../DEPLOYMENT.md) before any real schema change; never use `db push`, reset, seed or migration against an unidentified database.
 
 ## Impact and assumptions
 
@@ -14,7 +14,7 @@
 
 ## Illustrative additive PostgreSQL DDL
 
-The exact generated Prisma migration and constraint names must be reviewed against the actual schema and migration history before approval. This draft has **not** been executed or validated as a migration against PostgreSQL. A separate CREATE-only, schema-derived fixture was exercised on a new disposable cluster; its six local CHECK expressions statically match this draft, but those fixture results do not establish that the ALTER statements or existing data are compatible.
+The checked-in migration adds a transaction wrapper around this DDL. Its statements and constraints were run against synthetic prior-schema data and compared with a separate CREATE-only schema-derived fixture. That evidence does not establish compatibility with real historical data or migration history, and the official Prisma CLI path remains unverified. Review the actual migration, target schema and cutover plan before approval.
 
 ```sql
 CREATE TYPE "StockBucket" AS ENUM ('SELLABLE', 'DAMAGED');
@@ -135,6 +135,6 @@ ALTER TABLE "CourierOperation" ADD CONSTRAINT "CourierOperation_createdById_fkey
 ## Review before any approved migration
 
 1. Confirm backup/recovery and the identity of a disposable test instance, inventory any legacy returns/stock movements, and review current database constraints without changing data.
-2. Generate and inspect a new migration separately; compare it with the Prisma schema and this proposal, including the additional `CHECK` constraints that Prisma schema syntax does not express.
+2. Inspect the checked-in additive migration against the target migration history, Prisma schema and this proposal, including the additional `CHECK` constraints that Prisma schema syntax does not express; exercise the official migration CLI on an isolated copy.
 3. Exercise receipt caps, conflicting stock history, cancellation versus dispatch/booking, duplicate submissions, transaction rollback, and provider-failure recovery on the verified disposable instance, without destructive fixtures unless separately authorized.
 4. Obtain explicit authorization for any application to the real pre-production database. Treat historical repair and live-provider testing as separate approved work.

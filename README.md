@@ -1,64 +1,39 @@
 # LANDIQ
 
-LANDIQ is a self-hosted, single-tenant e-commerce landing page management application. One installation serves one business: create products and variants, build a separate landing page for each product, take Cash on Delivery orders, manage delivery and finances, and control staff permissions from one dashboard.
+LANDIQ is a self-hosted, single-business e-commerce application: manage products and stock, build landing pages, accept Cash on Delivery (COD) orders, track deliveries and manage staff. It is not a multi-tenant SaaS platform.
 
-It is **not** a SaaS platform. There are no subscriptions, workspaces, tenant routing, artificial product limits or mandatory third-party accounts.
+> **Not ready for production deployment.** Three safety assertions still fail when old and new order writers overlap; the official Prisma build/migration/seed CLI, existing installation data, Docker/TLS, real backups/restores and live providers have not been verified in this environment. See [deployment readiness](docs/DEPLOYMENT.md) and [test results](docs/TESTING.md) before planning a release.
 
-## What is implemented
+## Local setup
 
-- Next.js App Router + React + TypeScript (strict), Tailwind CSS, Lucide icons
-- PostgreSQL + Prisma schema with migrations (40+ models), transaction-safe stock and order operations
-- Session authentication, password hashing, reset flow, login history, RBAC with seven roles and server-side permission checks
-- Product/category/variant/attribute management, media library with signature validation, inventory movements and low-stock alerts
-- Section-based landing page builder (22 section types), six editable templates, drafts, versions, scheduling and publishing
-- Public `/shop` catalog and browser cart, plus `/p/[slug]` product pages with variant/quantity selection, coupons, responsive previews, SEO metadata, JSON-LD, sitemap and redirects
-- Single-product checkout (each cart item becomes a separate order) with COD, plus modular SSLCommerz, bKash and Nagad adapters with server-side callback verification
-- Courier settings with optional Pathao, Steadfast and REDX adapters and a complete manual courier workflow
-- Private `/track/[token]` pages with masked customer details, status timelines and cancellation of eligible pending COD orders
-- Customers, returns, refunds, coupons, reviews, analytics and notification channels with delivery logs
-- Marketing integrations (Meta Pixel/CAPI, Google Analytics, GTM) with server-side purchase events when configured
-- Audit logs, CSP/security headers, rate limiting, encrypted provider credentials, CSRF origin checks
-- Vitest + React Testing Library tests, Playwright spec, Docker/Nginx/backup tooling
+Start with the **[বাংলা local setup guide](docs/LOCAL_SETUP_BN.md)**. It walks through a *new, empty local development database*, owner setup and the demo product. It does not authorize resets or changes to an existing database.
 
-See [docs/IMPLEMENTATION_PROGRESS.md](docs/IMPLEMENTATION_PROGRESS.md) for verified status and remaining limitations.
+Node.js 22.12+ (Node 22 LTS recommended), npm, a supported embedded PostgreSQL platform and access to the official Prisma engine download are needed. An additive Phase 1 migration is now checked in, and its SQL was exercised on synthetic databases; the official Prisma CLI flow and compatibility with existing installations remain unverified. Never run migration, seed, `db push` or a reset against existing data without a reviewed plan and tested backup.
 
-## Quick start
+## What is available
 
-Requirements: Node.js 22+, npm, access to the official Prisma engine downloads, and a PostgreSQL database already matching the current `prisma/schema.prisma`.
+- Product variants, stock movements, media uploads, landing-page builder, templates and publishing.
+- `/shop`, browser-local cart and product pages. **Each cart line becomes a separate order**, not one combined checkout.
+- COD checkout, private tracking links, eligible customer cancellation, manager order handling, manual/shop delivery, receipt/inspection-based returns and internal refund records.
+- Session authentication, staff roles, mandatory temporary-password changes, settings and selected server-side permission checks.
+- Payment and courier adapters, notifications, marketing integrations and storage options. External services remain unverified; keep them disabled until separately tested.
 
-**Database prerequisite:** the checked-in migration history does not yet bring an existing database to the current Phase 1 schema. The proposal in `docs/proposals/PHASE_1_ORDER_INVENTORY_MIGRATION.md` needs a separate, reviewed migration and historical-data verification. Do not run a reset, `db push`, seed, or migrations against an existing database without an approved backup and migration plan. The browser test fixture is disposable and is not an installation migration.
+A cancellation can be recorded without returning stock when physical or financial evidence is uncertain. A return report does not credit stock until staff record and inspect a physical receipt. An internal refund record is not proof that money was paid back. Protect tracking/reset links as secrets.
 
-With a compatible database and the official Prisma engine available:
+## Commands
 
-```bash
-npm ci
-test -f .env || cp .env.example .env
-# Edit .env: set DATABASE_URL, NEXT_PUBLIC_SITE_URL and a long random CREDENTIALS_ENCRYPTION_KEY
-npm run prisma:generate
-npm run dev                 # binds 0.0.0.0:3000
-```
-
-Visit `/shop` to browse published products whose landing pages are published. Orders are placed separately for each cart item. Save the private confirmation/tracking link; eligible pending COD orders can be cancelled there. A new store also requires an authorized owner, enabled COD configuration, stock, and published product/landing-page records before it can accept orders.
-
-## Common commands
-
-| Command | Purpose |
+| Command | Use |
 | --- | --- |
-| `npm run typecheck` | TypeScript strict check |
-| `npm run lint` | ESLint |
-| `npm test` | Vitest unit, component and database integration tests |
-| `npm run build` | Production build |
-| `npm start` | Production server |
-| `npm run test:e2e` | Playwright browser workflows (requires installed browser) |
-| `npm run prisma:migrate` | Create a migration after schema changes |
-| `bash scripts/backup.sh` | Encrypted database backup |
+| `npm run db:dev` | Start the persistent, loopback-only local embedded PostgreSQL helper |
+| `npm run db:check-empty` | Read-only preflight for the documented **new empty** embedded local DB only |
+| `npm run prisma:generate` | Generate the normal Prisma client; requires official engine download |
+| `npm run prisma:deploy` | Apply checked-in migrations; **new local DB or separately approved target only** |
+| `npm run db:seed` | One-time owner bootstrap of an empty migrated DB; explicit credentials required |
+| `npm run dev` | Development server on port 3000 |
+| `npm test` | Selected unit, component and mocked-service suites, not all DB/E2E tests |
+| `npm run typecheck` / `npm run lint` | Static checks |
+| `npm run build` / `npm start` | Intended production build/server; not yet verified with the normal native Prisma client here |
 
-## Architecture in one paragraph
+The historical destructive integration and Playwright suites need explicit opt-in and a dedicated disposable database; their opt-ins do **not** verify database identity. Prefer the identity-verified fixture suites described in [TESTING.md](docs/TESTING.md).
 
-`src/app` contains Server Components, Server Actions and Route Handlers; `src/components` holds reusable UI and public/dashboard components; `src/services` implements business workflows; `src/lib` contains validation, security, settings, integrations and provider adapters; `prisma` holds the schema, migrations and seed. Public requests never receive credentials, internal notes or full customer addresses. Server actions and APIs re-check permissions and payment/courier availability before doing work.
-
-Full documentation: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/DATABASE.md](docs/DATABASE.md), [docs/API.md](docs/API.md), [docs/SECURITY.md](docs/SECURITY.md), [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md), [docs/ENVIRONMENT.md](docs/ENVIRONMENT.md), [docs/TESTING.md](docs/TESTING.md).
-
-## Integration status
-
-COD and manual courier are implemented and verified without any external credentials. Payment and courier provider adapters use real HTTP APIs and are isolated behind interfaces, but live transactions were **not** executed because no merchant accounts or API keys were available. Dashboard connection tests surface provider failures; disabled or unconfigured providers never appear at checkout. See [docs/IMPLEMENTATION_PROGRESS.md](docs/IMPLEMENTATION_PROGRESS.md).
+Further documentation: [Environment](docs/ENVIRONMENT.md) · [Database](docs/DATABASE.md) · [Security](docs/SECURITY.md) · [Implementation status](docs/IMPLEMENTATION_PROGRESS.md) · [API](docs/API.md) · [Architecture](docs/ARCHITECTURE.md).

@@ -1,18 +1,26 @@
 import { prisma } from "@/lib/prisma";
 import { AppError } from "@/lib/errors";
-import { removeFile, storeFile, validateUpload } from "@/lib/storage";
+import { MAX_UPLOAD_BYTES, removeFile, storeFile, validateUpload } from "@/lib/storage";
 import { audit } from "@/lib/audit";
 
 export async function uploadMedia(file: File, folder: string, alt: string, actorId: string) {
+  if (file.size > MAX_UPLOAD_BYTES) throw new AppError("File exceeds the 20 MB limit", "FILE_TOO_LARGE", 413);
   const bytes = Buffer.from(await file.arrayBuffer());
   const ext = validateUpload(file.type, bytes);
   const stored = await storeFile(bytes, file.type, ext);
-  const asset = await prisma.mediaAsset.create({
-    data: {
-      name: file.name.slice(0, 200), key: stored.key, url: stored.url,
-      mimeType: file.type, size: bytes.length, alt: alt || null, folder: folder || "General",
-    },
-  });
+  let asset;
+  try {
+    asset = await prisma.mediaAsset.create({
+      data: {
+        name: file.name.slice(0, 200), key: stored.key, url: stored.url,
+        mimeType: file.type, size: bytes.length, alt: alt || null, folder: folder || "General",
+      },
+    });
+  } catch (error) {
+    // Do not leave a successfully uploaded file without a media record.
+    await removeFile(stored.key).catch(() => undefined);
+    throw error;
+  }
   await audit({ actorId, action: "UPLOAD_MEDIA", entity: "MediaAsset", entityId: asset.id, after: { key: stored.key } });
   return asset;
 }

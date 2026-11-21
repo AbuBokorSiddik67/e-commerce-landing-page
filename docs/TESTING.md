@@ -1,54 +1,59 @@
-# Testing
+# Testing and evidence
 
-## Commands and verified results
+Last reviewed: 2026-11-19. These are scoped checks, **not** a production certification. No existing database or live provider was used. See [DEPLOYMENT.md](DEPLOYMENT.md) for release blockers.
 
-For the product-preservation changes, the focused unit/component/mocked-service run passed 122 tests, the opt-in disposable PostgreSQL fixture passed 10 tests, and typecheck, lint and production build passed. The full database-backed integration and Playwright suites were not rerun for this change.
+## Current results
 
-Some integration suites use `tests/helpers.ts`, whose reset helper truncates public tables. Never point them at an existing or unidentified database, and do not run them when a database reset is not expressly permitted.
-
-### Product preservation checks
-
-The focused unit, component and mocked-service checks can be run without a database:
-
-```bash
-npx vitest run tests/unit tests/components tests/integration/product-attributes-compatibility.test.ts tests/integration/order-attribute-compatibility.test.ts
-```
-
-A separate opt-in suite creates a fresh embedded PostgreSQL cluster in a unique `tmp/phase11-postgres-*` directory, checks its directory, port and user before creating a partial test-only schema, and removes only that newly created cluster on exit:
-
-```bash
-LANDIQ_DISPOSABLE_PG_TEST=1 npx vitest run tests/integration/product-disposable-postgres.test.tsx
-```
-
-This suite ignores `DATABASE_URL`, does not run migrations or `db push`, and never invokes the reset helper. It tests actual PostgreSQL transactions and selected foreign keys, but its partial fixture is not the full deployed schema and is not a replacement for migration or full application end-to-end testing. It requires a working Prisma query engine and embedded PostgreSQL support on the host.
-
-## Covered workflows
-
-| Area | Coverage |
+| Check | Result and scope |
 | --- | --- |
-| Pricing and coupons | Variant/sale price precedence, capped discounts, expiry, limits, first-order and product scope |
-| Permissions | Owner, specialised roles, combined roles, forbidden settings access |
-| Sections | All 22 section types, six templates, strict schema rejects arbitrary keys/scripts |
-| Payment adapters | Missing credentials, SSLCommerz init/validation, bKash query verification, registry |
-| Scenario A | COD-only checkout: no gateway call, order created, stock reduced, no payment transaction |
-| Scenario B | COD + bKash visibility; disabled providers rejected by backend; missing credentials hidden and flagged |
-| Scenario C | COD disabled is rejected and not offered |
-| Scenario D | Manual courier assignment, manual tracking events, status history, no API required |
-| Scenario E | Disabled/misconfigured courier booking rejected |
-| Scenario F | Provider failure cancels order, restores stock, never marks it paid |
-| Payment callbacks | Server-side validation, amount check, duplicate callback idempotency, disabled provider rejection |
-| Inventory | Concurrent last-unit orders (one succeeds), cancellation restocks |
-| Products/pages | Create/update/duplicate, variant stock, template application, drafts/versions/publish, slug and section validation |
-| Form validation | Product and builder FormData, multiple variant attributes, existing IDs and relationships, checked/unchecked booleans, invalid payloads, and PostgreSQL migration of legacy variant JSON |
-| Authentication | Login, session restore, logout revocation, wrong password |
-| Components | Accessible alert/empty states via React Testing Library |
+| `npm test` | **266 passed in 43 files**: selected unit, jsdom component and mocked-service/access tests. This command intentionally does not run every integration or browser suite. |
+| `npm run typecheck`, `npm run lint`, `git diff --check` | Passed. Lint uses the deprecated Next 15 lint wrapper. |
+| Disposable migration/auth suite | **10/10 passed**: checked-in SQL applied to synthetic pre-Phase-1 data, compared with a generated current-schema reference, rollback/constraints, one-time bootstrap and selected staff/reset/login races. This did **not** run the official Prisma migration or seed CLI, or touch existing installation data. |
+| Disposable product suite | **15/15 passed**, including product/variant preservation and races, with a partial test-only schema. |
+| Disposable Phase 1 closure suite | **27/27 passed**, including checkout/cancellation, receipt/inspection, courier and own-delivery scenarios. Provider calls are mocked; fixture schema is not a migration. |
+| Disposable inventory/order suite | **172 passed, 3 failed, 175 total.** The three failures are the unskipped mixed-version safety assertions below. Cancellation, return and race tests were updated for the current contract and still assert stock, ledger, reservation and reconciliation outcomes. |
+| Browser smoke | Isolated Chromium 153/Next development fixtures passed selected shop/cart, COD checkout/cancellation, staff permissions, returns/stock, settings and auth flows. A Next production-mode smoke covered media/range/delete and COD using an injected JS test client. These are not the official native production build, complete route/role coverage or live-provider tests. |
+| Local helper / backup | New embedded UTF-8 DB persisted Bengali across a restart. The read-only local empty-DB preflight passed on its own new cluster and refused a host override and a nonempty fixture. Backup script syntax and three stubbed tests passed; actual `pg_dump`, GPG encryption and restore did not run. |
+| Dependency audit | `npm audit` and `npm audit --omit=dev`: **4 high**, no critical/moderate at review time, in the Prisma/config chain. Audit results can change. |
 
-## Playwright
+The mixed-version tests execute byte-identical old order-writer snapshots with current shared dependencies and mocked couriers—not a deployed old binary. They demonstrated: (1) a new cancellation restores stock while an old, unclaimed booking is in flight; (2) an old writer books after a new cancellation; and (3) an old cancellation restores stock while a new booking claim is in flight. They remain **failures**, not expected passes. See [the earlier inventory audit](audits/PHASE_1_INVENTORY_ORDER_INTEGRITY.md); a verified fence, provider reconciliation and rollback procedure are still required.
 
-The Playwright suite covers owner login, a customer COD order, invalid tracking, and creating/updating product variants and builder checkboxes through the browser. All four tests passed in an earlier run against a seeded local PostgreSQL database and a production server; the updated form test was not rerun for these product-preservation changes. The form regression test removes its own uniquely named product afterwards; use a dedicated test database for the suite, since the COD test creates an order.
+## Safe selected checks
 
-The official Chromium download endpoint was blocked in this sandbox, so the run used a temporary Chromium 153 headless binary and its libraries obtained from npm. In a normal environment, install the Playwright-managed browser with `npx playwright install chromium`, seed the test database, and run `npm run test:e2e`.
+With dependencies and a generated Prisma client installed:
 
-## Not verified
+```bash
+npm test
+npm run typecheck
+npm run lint
+git diff --check
+```
 
-Live SSLCommerz, bKash, Nagad, Pathao, Steadfast and REDX calls require merchant accounts, approved keys and webhook registration. Adapter unit tests mock provider responses; dashboard connection tests call the real APIs when configured. Do not treat mocked results as live certification.
+`npm test` selects `tests/unit`, `tests/components`, the two attribute-compatibility suites and `phase1-access.test.ts`. It does not establish real database/provider behavior. In the review environment these commands used an unusable fallback `DATABASE_URL` and an ignored, generated **JS-engine test client with a pg adapter**, because the official native engine download failed TLS.
+
+## Opt-in, identity-verified disposable database suites
+
+These suites start their own embedded PostgreSQL cluster in a fresh ignored `tmp/` directory, verify the local process and database identity before fixture writes, and clean up their own scratch cluster. They ignore any ambient real `DATABASE_URL`. The migration suite executes the checked-in migration SQL only on synthetic databases; the other suites use test-only fixture schemas and mocked providers.
+
+They require a Prisma client compatible with `@prisma/adapter-pg`. The review used a temporary JS-engine test client generated by `tests/fixtures/generate-phase1-test-client.cjs` with matching `@prisma/internals@6.19.3`; that replaces the ignored client in `node_modules` and is **not a production client**. Recreate the normal client with `npm run prisma:generate` before normal application use. Do not install untrusted binaries or disable TLS verification.
+
+```bash
+# After setting up a compatible test client; the invalid URL is deliberate.
+export DATABASE_URL='postgresql://invalid:invalid@invalid:1/invalid'
+LANDIQ_MIGRATION_DISPOSABLE_PG=1 LANDIQ_DISPOSABLE_PG_TEST=1 LANDIQ_PHASE1_CLOSURE_DISPOSABLE_PG=1 \
+  npx vitest run tests/integration/phase1-migration-disposable.test.ts \
+  tests/integration/product-disposable-postgres.test.tsx tests/integration/phase1-closure-disposable-postgres.test.ts
+
+# This currently exits nonzero: three mixed-version safety assertions fail.
+LANDIQ_INVENTORY_DISPOSABLE_PG_TEST=1 \
+  npx vitest run tests/integration/inventory-order-disposable-postgres.test.ts
+```
+
+Do not interpret a skipped suite without its opt-in as a pass. Provider responses are synthetic. `tests/fixtures/phase1-disposable-schema.sql` is a generated CREATE-only fixture, **not** an installation migration.
+
+## Other tests and destructive operations
+
+- Historical suites using `tests/helpers.ts` can truncate all application tables. `LANDIQ_ALLOW_DESTRUCTIVE_TEST_DB=1` only opts in; it does **not** verify identity. Do not set it for an existing or unidentified DB. Prefer the fixtures above.
+- The older `npm run test:e2e` requires `LANDIQ_E2E_DISPOSABLE=1`, dedicated `E2E_OWNER_EMAIL`/`E2E_OWNER_PASSWORD`, a pre-seeded demo and an installed browser. It creates orders and deletes test products; the flag does **not** verify DB identity. It was not rerun as the current verification. Use only a separately verified disposable database.
+- Browser harness scripts in `tests/fixtures/phase1-browser-*` are separate isolated fixtures. Their synthetic credentials/metadata under `tmp/` are temporary secrets and must not be copied into a real setup. Forged viewer actions were denied without mutations in the checked development flows; some denied Server Actions returned HTTP 500 rather than 403 in Next development.
+- No real SSLCommerz, bKash, Nagad, Pathao, Steadfast, REDX, SMTP, SMS or S3 operation was verified. A connection check is not proof of a successful real transaction. Official Prisma CLI, Docker, TLS, real backup/restore and historical production data remain unverified.

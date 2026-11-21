@@ -89,6 +89,33 @@ describe("Phase 1 direct access controls", () => {
     expect(state.session).not.toHaveBeenCalled();
   });
 
+  it("blocks temporary-password sessions from direct actions and CSV export", async () => {
+    state.role = "ORDER_MANAGER";
+    state.session.mockImplementation(async () => ({ id: "session-1", revokedAt: null, expiresAt: new Date("2100-01-01"),
+      user: { id: "user-1", name: "Fixture", email: "fixture@example.invalid", isActive: true,
+        mustResetPassword: true, roles: [{ role: { key: state.role } }] } }));
+    await expect(bookCourierAction(form())).rejects.toThrow("TEST_REDIRECT:/change-password");
+    expect((await exportOrders(new Request("https://fixture.invalid/api/orders/export"))).status).toBe(403);
+    expect(state.bookCourier).not.toHaveBeenCalled();
+    expect(state.orderFindMany).not.toHaveBeenCalled();
+  });
+
+  it("exports customer-controlled spreadsheet formulas as literal text", async () => {
+    state.role = "ORDER_MANAGER";
+    state.orderFindMany.mockResolvedValue([{ orderNumber: "LDQ-FIXTURE", createdAt: new Date("2026-01-01T00:00:00Z"),
+      customer: { name: '=HYPERLINK("https://fixture.invalid")', phone: "+8801700000000", email: "buyer@fixture.invalid" },
+      items: [{ name: "+DANGEROUS", quantity: 1 }], subtotal: 500, deliveryCharge: 0, discount: 0, total: 500,
+      paymentMethod: "cod", paymentStatus: "COD_PENDING", status: "PENDING", financialStatus: "UNSETTLED",
+      settlementStatus: "PENDING", district: "Rajshahi", address: "  @fixture" }]);
+    const response = await exportOrders(new Request("https://fixture.invalid/api/orders/export"));
+    expect(response.status).toBe(200);
+    const csv = await response.text();
+    expect(csv).toContain(`"'=HYPERLINK(""https://fixture.invalid"")"`);
+    expect(csv).toContain("'+8801700000000");
+    expect(csv).toContain("'+DANGEROUS x1");
+    expect(csv).toContain("'  @fixture");
+  });
+
   it("denies a read-only viewer every direct stock, courier, cancellation, return and refund action", async () => {
     const actions = [bookCourierAction, manualCourierAction, cancelOrderAction, orderStatusAction, syncTrackingAction,
       collectCodAction, settleCodAction, createReturnAction, returnStatusAction, recordRefundAction, providerRefundAction, setStockAction];

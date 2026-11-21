@@ -32,8 +32,8 @@ export const nagadProvider: PaymentProvider = {
       signRequest("connection-test", credentials.privateKey);
       encryptWithPublicKey("connection-test", credentials.publicKey);
       return { ok: true, message: "Local RSA key validation passed; live approval still required" };
-    } catch (error) {
-      return { ok: false, message: error instanceof Error ? error.message : "Invalid keys" };
+    } catch {
+      return { ok: false, message: "Invalid RSA key format" };
     }
   },
 
@@ -63,7 +63,7 @@ export const nagadProvider: PaymentProvider = {
     });
     const paymentRefId = String(result.paymentRefId ?? "");
     const gatewayUrl = String(result.paymentGatewayUrl ?? "");
-    if (!paymentRefId || !gatewayUrl) throw new Error(`Nagad initialization failed: ${JSON.stringify(result).slice(0, 300)}`);
+    if (!paymentRefId || !gatewayUrl) throw new Error("Nagad initialization failed");
     return { reference: paymentRefId, checkoutUrl: gatewayUrl, status: "INITIATED", raw: result };
   },
 

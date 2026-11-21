@@ -55,7 +55,7 @@ export async function testPaymentAction(formData: FormData) {
   await finish("/dashboard/payments", async () => {
     const result = await testPaymentConnection(str(formData, "code"));
     if (!result.ok) throw new Error(result.message);
-  }, "Connection test succeeded");
+  }, "Connection check completed; review status and verify a real sandbox transaction");
 }
 
 export async function courierConfigAction(formData: FormData) {
@@ -80,7 +80,7 @@ export async function testCourierAction(formData: FormData) {
   await finish("/dashboard/couriers", async () => {
     const result = await testCourierConnection(str(formData, "code"));
     if (!result.ok) throw new Error(result.message);
-  }, "Connection test succeeded");
+  }, "Connection check completed; verify a real sandbox shipment");
 }
 
 export async function deliverySettingsAction(formData: FormData) {

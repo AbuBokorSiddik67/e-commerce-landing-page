@@ -36,8 +36,9 @@ export async function createReturnRequest(raw: z.input<typeof returnSchema>, act
   try {
     const { notifyOwners } = await import("@/lib/notifications");
     await notifyOwners("RETURN_REQUESTED", "New return request", `${orderNumber}: ${input.reason}`);
-  } catch (error) {
-    console.error("Return request committed but notification failed", { orderId: input.orderId, error });
+  } catch {
+    // Notification errors may echo provider credentials or customer data.
+    console.error("Return request committed but notification failed", { orderId: input.orderId });
   }
   return request;
 }

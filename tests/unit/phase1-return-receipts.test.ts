@@ -13,6 +13,7 @@ vi.mock("@/services/inventory", () => ({ adjustStock: mocks.adjust, receiveDamag
 vi.mock("@/services/order-lock", () => ({ lockOrder: vi.fn() }));
 
 import { createReturnRequest, inspectReturnReceipt, receiveReturnItems, updateReturnStatus } from "@/services/returns";
+import { notifyOwners } from "@/lib/notifications";
 
 type Item = { id: string; variantId: string; quantity: number; name: string };
 type Order = { id: string; orderNumber: string; productId: string; status: string; items: Item[]; refunds: Array<{ amount: number; status: string }> };
@@ -120,6 +121,19 @@ beforeEach(() => {
 });
 
 describe("partial physical returns", () => {
+  it("does not log provider errors after a return notification fails", async () => {
+    store.requests = [];
+    vi.mocked(notifyOwners).mockRejectedValueOnce(new Error("fixture-secret and private-customer-data"));
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const request = await createReturnRequest({ orderId: "order-1", reason: "A physical return" }, "staff");
+      expect(request.orderId).toBe("order-1");
+      expect(log).toHaveBeenCalledOnce();
+      expect(JSON.stringify(log.mock.calls)).not.toContain("fixture-secret");
+      expect(JSON.stringify(log.mock.calls)).not.toContain("private-customer-data");
+    } finally { log.mockRestore(); }
+  });
+
   it("receives without stock, then atomically splits sellable and damaged stock once", async () => {
     const receipt = await receiveReturnItems(receiptInput(2), "receiver");
     expect(store.sellable).toBe(4); expect(store.damaged).toBe(0); expect(store.movements).toHaveLength(0);
