@@ -1,15 +1,20 @@
 import Link from "next/link";
-import { formatDate, maskAddress, maskPhone } from "@/lib/utils";
+import { formatDate, maskPhone } from "@/lib/utils";
 import { checkRateLimit } from "@/lib/rate-limit";
 import { getOrderByTrackingToken, STATUS_LABELS } from "@/services/orders";
-import { Badge } from "@/components/ui";
+import { Alert, Badge } from "@/components/ui";
+import { ConfirmButton } from "@/components/ui/ConfirmButton";
 import { headers } from "next/headers";
+import { cancelCustomerOrderAction } from "./actions";
 
 export const dynamic = "force-dynamic";
 export const metadata = { title: "Track your order", robots: { index: false, follow: false } };
 
-export default async function TrackPage({ params }: { params: Promise<{ token: string }> }) {
+export default async function TrackPage({ params, searchParams }: {
+  params: Promise<{ token: string }>; searchParams?: Promise<{ error?: string; success?: string }>;
+}) {
   const { token } = await params;
+  const query = searchParams ? await searchParams : {};
   const h = await headers();
   checkRateLimit(`track:${h.get("x-forwarded-for") ?? "unknown"}`, 25, 60 * 60 * 1000);
   const order = token === "demo" ? null : await getOrderByTrackingToken(token);
@@ -30,6 +35,7 @@ export default async function TrackPage({ params }: { params: Promise<{ token: s
       <div className="container-wide max-w-3xl">
         <div className="mb-6"><Link href="/" className="text-sm text-ink-500 hover:text-brand-700">← Back to store</Link></div>
         <div className="surface p-6 sm:p-8">
+          <Alert error={query.error} success={query.success} />
           <div className="flex flex-wrap items-start justify-between gap-4">
             <div><p className="section-label">Order tracking</p><h1 className="mt-2 text-2xl font-semibold">{order.orderNumber}</h1><p className="mt-1 text-sm text-ink-500">Placed {formatDate(order.createdAt)}</p></div>
             <Badge tone={order.status === "DELIVERED" ? "success" : order.status === "CANCELLED" ? "danger" : "info"}>{STATUS_LABELS[order.status]}</Badge>
@@ -62,6 +68,11 @@ export default async function TrackPage({ params }: { params: Promise<{ token: s
             </div>
           )}
           {order.expectedDeliveryAt && <p className="mt-4 text-sm text-ink-600">Expected delivery: {formatDate(order.expectedDeliveryAt)}</p>}
+          {order.status === "PENDING" && order.paymentMethod === "cod" && order.paymentStatus === "COD_PENDING" && !order.shipments.length && <form action={cancelCustomerOrderAction} className="mt-6 border-t border-ink-100 pt-5">
+            <input type="hidden" name="token" value={token} />
+            <p className="mb-3 text-sm text-ink-600">Pending Cash on Delivery orders can be cancelled before the store starts fulfillment.</p>
+            <ConfirmButton className="btn-danger" message="Cancel this order?">Cancel order</ConfirmButton>
+          </form>}
           <p className="mt-6 text-xs text-ink-400">For privacy, phone numbers and full addresses are hidden on this page. Never share your tracking link publicly.</p>
         </div>
       </div>

@@ -193,6 +193,17 @@ describe("partial physical returns", () => {
     expect(store.history).toHaveLength(1);
   });
 
+  it("validates receipt-linked ledger evidence even on an exact completed-status retry", async () => {
+    const receipt = await receiveReturnItems(receiptInput(2), "receiver");
+    await inspectReturnReceipt({ receiptId: receipt.id, sellableQuantity: 1, damagedQuantity: 1 }, "inspector");
+    await updateReturnStatus("return-1", "INSPECTED", "staff");
+    await updateReturnStatus("return-1", "COMPLETED", "staff");
+    expect((await updateReturnStatus("return-1", "COMPLETED", "staff")).status).toBe("COMPLETED");
+    store.movements = store.movements.filter((movement) => movement.bucket !== "DAMAGED");
+    await expect(updateReturnStatus("return-1", "COMPLETED", "staff")).rejects.toThrow(/incomplete or duplicated/);
+    expect(store.sellable).toBe(5); expect(store.damaged).toBe(1);
+  });
+
   it("keeps the commercial order cancelled after all goods are physically returned", async () => {
     store.order.status = "CANCELLED";
     const receipt = await receiveReturnItems(receiptInput(4), "receiver");

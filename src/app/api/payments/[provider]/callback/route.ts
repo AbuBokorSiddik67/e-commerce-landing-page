@@ -1,6 +1,5 @@
 import { NextResponse } from "next/server";
 import { processPaymentCallback } from "@/services/orders";
-import { toErrorMessage } from "@/lib/errors";
 import { checkRateLimit } from "@/lib/rate-limit";
 
 export const runtime = "nodejs";
@@ -35,13 +34,18 @@ async function handle(request: Request, provider: string, redirectAfter: boolean
     checkRateLimit(`payment-callback:${provider}:${request.headers.get("x-forwarded-for") ?? "unknown"}`, 30, 10 * 60 * 1000);
     const result = await processPaymentCallback(provider, await payload(request));
     const base = (process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000").replace(/\/$/, "");
-    if (redirectAfter) return NextResponse.redirect(`${base}/order-confirmed?order=${encodeURIComponent(result.orderNumber)}&payment=${result.ok ? "verified" : "failed"}`);
+    // Provider POST callbacks must redirect as GET. The callback itself is not
+    // a capability to disclose the customer's private tracking token.
+    if (redirectAfter) return NextResponse.redirect(`${base}/order-confirmed?order=${encodeURIComponent(result.orderNumber)}`, 303);
     return NextResponse.json(result);
-  } catch (error) {
+  } catch {
+    // Provider or infrastructure errors may contain credentials or private
+    // payloads. Never reflect those details in a public redirect or response.
+    const message = "Payment could not be verified. Contact the store before placing the order again.";
     if (redirectAfter) {
       const base = (process.env.NEXT_PUBLIC_SITE_URL ?? "http://localhost:3000").replace(/\/$/, "");
-      return NextResponse.redirect(`${base}/checkout/failed?reason=${encodeURIComponent(toErrorMessage(error))}`);
+      return NextResponse.redirect(`${base}/checkout/failed?reason=${encodeURIComponent(message)}`, 303);
     }
-    return NextResponse.json({ error: toErrorMessage(error) }, { status: 400 });
+    return NextResponse.json({ error: message }, { status: 400 });
   }
 }

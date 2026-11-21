@@ -38,15 +38,74 @@ export const checkoutSchema = z.object({
   customerNote: z.string().max(1000).optional(),
   visitorId: z.string().max(100).optional(),
   ip: z.string().max(80).optional(),
+  // Random UUIDv4 acts as a capability to retrieve the same checkout result.
+  // Optional for legacy API clients, which retain the time-window guard.
+  idempotencyKey: z.string().uuid().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i).optional(),
 });
 
 export type CheckoutInput = z.input<typeof checkoutSchema>;
+type ParsedCheckout = z.output<typeof checkoutSchema>;
+type CheckoutOperation = { id: string; fingerprint: string };
+
+function checkoutOperation(input: ParsedCheckout): CheckoutOperation | null {
+  if (!input.idempotencyKey) return null;
+  const key = input.idempotencyKey.toLowerCase();
+  const { idempotencyKey: _key, ip: _ip, visitorId: _visitor, ...details } = input;
+  void _key; void _ip; void _visitor;
+  return {
+    // Reuse the existing primary-key constraint, as with receipt/refund claims.
+    id: `checkout_${createHash("sha256").update(`landiq-checkout-v1:${key}`).digest("hex")}`,
+    fingerprint: createHmac("sha256", key).update(JSON.stringify(["landiq-checkout-v1", details])).digest("hex"),
+  };
+}
+
+/** Never restart an online payment during a replay, even when its outcome is unknown. */
+async function replayCheckout(operation: CheckoutOperation) {
+  const order = await prisma.order.findUnique({ where: { id: operation.id }, include: { payments: true } });
+  if (!order) return null;
+  const audits = await prisma.auditLog.findMany({ where: { entity: "Order", entityId: order.id, action: "ORDER_PLACED" },
+    select: { after: true }, take: 2 });
+  const marker = audits.length === 1 ? z.object({ checkoutFingerprint: z.string() }).safeParse(audits[0].after) : null;
+  if (!marker?.success || marker.data.checkoutFingerprint !== operation.fingerprint) {
+    throw new ConflictError("This checkout key was already used with different details or requires staff review");
+  }
+  if (["CANCELLED", "RETURNED"].includes(order.status)) {
+    throw new ConflictError(`Order ${order.orderNumber} is closed; contact the store before placing another order`);
+  }
+  if (order.paymentMethod === "cod") return { order, checkoutUrl: null as string | null };
+  if (order.paymentStatus === "PAID") return { order, checkoutUrl: null as string | null };
+  if (order.status === "PENDING" && order.paymentStatus === "PENDING" && order.payments.length === 1
+    && order.payments[0].provider === order.paymentMethod && order.payments[0].status === "INITIATED") {
+    return { order, checkoutUrl: order.payments[0].checkoutUrl };
+  }
+  throw new ConflictError(`Order ${order.orderNumber} has an unresolved payment session. Do not place it again; contact the store.`);
+}
 
 export async function placeOrder(raw: CheckoutInput) {
   const input = checkoutSchema.parse(raw);
+  if (input.ip) checkRateLimit(`order:${input.ip}:${input.customer.phone}`, 6, 10 * 60 * 1000);
+  const operation = checkoutOperation(input);
+  if (operation) {
+    const existing = await replayCheckout(operation);
+    if (existing) return existing;
+  }
+  try {
+    return await placeNewOrder(input, operation);
+  } catch (error) {
+    // Another transaction may have committed the same key after the first
+    // lookup, or a committed order may have lost its response. Never reissue
+    // an external payment call while recovering that result.
+    if (operation) {
+      const existing = await replayCheckout(operation);
+      if (existing) return existing;
+    }
+    throw error;
+  }
+}
+
+async function placeNewOrder(input: ParsedCheckout, operation: CheckoutOperation | null) {
   // Server-side provider validation is mandatory: frontend visibility is never trusted.
   const method = await assertPaymentMethodAvailable(input.paymentMethod);
-  if (input.ip) checkRateLimit(`order:${input.ip}:${input.customer.phone}`, 6, 10 * 60 * 1000);
 
   const product = await prisma.product.findUnique({
     where: { id: input.productId },
@@ -60,14 +119,18 @@ export async function placeOrder(raw: CheckoutInput) {
   // rewrite it: legacy snapshots and already-placed orders keep their shape.
   normalizeStoredVariantAttributes(variant.attributes, { productName: product.name, variantName: variant.name });
 
-  const duplicate = await prisma.order.findFirst({
-    where: {
-      customer: { phone: input.customer.phone },
-      productId: product.id,
-      createdAt: { gte: new Date(Date.now() - 15_000) },
-    },
-  });
-  if (duplicate) throw new ConflictError("An order was just submitted. Please wait before repeating.");
+  // Keyed requests represent distinct explicit purchase operations. Preserve
+  // the legacy heuristic for clients that do not yet send an operation key.
+  if (!operation) {
+    const duplicate = await prisma.order.findFirst({
+      where: {
+        customer: { phone: input.customer.phone },
+        productId: product.id,
+        createdAt: { gte: new Date(Date.now() - 15_000) },
+      },
+    });
+    if (duplicate) throw new ConflictError("An order was just submitted. Please wait before repeating.");
+  }
 
   const customerOrderCount = await prisma.order.count({ where: { customer: { phone: input.customer.phone } } });
   let discount = 0;
@@ -139,12 +202,14 @@ export async function placeOrder(raw: CheckoutInput) {
       SELECT "id" FROM "Customer" WHERE "id" = ${customer.id} FOR UPDATE
     `;
     if (!customerLock.length) throw new ConflictError("Customer details changed while placing the order");
-    const duplicateAfterLock = await tx.order.findFirst({ where: { customerId: customer.id, productId: product.id,
-      createdAt: { gte: new Date(Date.now() - 15_000) } }, select: { id: true } });
-    if (duplicateAfterLock) throw new ConflictError("An order was just submitted. Please wait before repeating.");
-
+    if (!operation) {
+      const duplicateAfterLock = await tx.order.findFirst({ where: { customerId: customer.id, productId: product.id,
+        createdAt: { gte: new Date(Date.now() - 15_000) } }, select: { id: true } });
+      if (duplicateAfterLock) throw new ConflictError("An order was just submitted. Please wait before repeating.");
+    }
     const created = await tx.order.create({
       data: {
+        ...(operation ? { id: operation.id } : {}),
         orderNumber: orderNumber(),
         customerId: customer.id,
         productId: product.id,
@@ -198,7 +263,8 @@ export async function placeOrder(raw: CheckoutInput) {
       await tx.couponRedemption.create({ data: { couponId, customerId: customer.id, orderId: created.id } });
     }
     await tx.auditLog.create({
-      data: { action: "ORDER_PLACED", entity: "Order", entityId: created.id, after: { orderNumber: created.orderNumber, total: created.total, paymentMethod: input.paymentMethod } as never },
+      data: { action: "ORDER_PLACED", entity: "Order", entityId: created.id, after: { orderNumber: created.orderNumber,
+        total: created.total, paymentMethod: input.paymentMethod, ...(operation ? { checkoutFingerprint: operation.fingerprint } : {}) } as never },
     });
     return created;
   });
@@ -390,15 +456,25 @@ async function canReleaseCancellationStock(tx: Prisma.TransactionClient, order: 
 }
 
 async function cancelOrderLocked(
-  tx: Prisma.TransactionClient, orderId: string, actorId: string | null, reason: string, expiryBefore?: Date,
+  tx: Prisma.TransactionClient, orderId: string, actorId: string | null, reason: string, expiryBefore?: Date, customerToken?: string,
 ) {
   await lockOrder(tx, orderId);
   const order = await tx.order.findUniqueOrThrow({
     where: { id: orderId }, include: { items: true, payments: true, paymentAttempts: true, reservations: true, refunds: true },
   });
+  if (customerToken && order.trackingToken !== customerToken) throw new NotFoundError("Order not found");
   if (order.status === "CANCELLED") return { order, changed: false, stockReleased: Boolean(order.cancellationStockReleasedAt) };
   if (order.status === "RETURNED") throw new ConflictError("This order has already been fully returned");
+  // Customers can cancel only pending COD orders, and only when the same
+  // locked transaction can prove the stock release is safe. Managers retain
+  // the separate reconciliation workflow for everything else.
+  if (customerToken && (order.status !== "PENDING" || order.paymentMethod !== "cod" || order.paymentStatus !== "COD_PENDING")) {
+    throw new ConflictError("This order can no longer be cancelled online. Please contact the store.");
+  }
   const stockReleased = await canReleaseCancellationStock(tx, order);
+  if (customerToken && !stockReleased) {
+    throw new ConflictError("This order needs store review before cancellation. Please contact the store.");
+  }
   if (expiryBefore) {
     const active = order.reservations.filter((reservation) => !reservation.releasedAt);
     if (!stockReleased || order.paymentMethod === "cod" || order.status !== "PENDING" || !active.length
@@ -442,6 +518,15 @@ async function cancelOrderLocked(
     entity: "Order", entityId: orderId, before: { status: order.status },
     after: { status: "CANCELLED", reason, stockReleased, ownDeliveryRequiresReview } } });
   return { order, changed: true, stockReleased };
+}
+
+/** The tracking token is a secret capability; never accept an order ID here. */
+export async function cancelCustomerOrder(trackingToken: string) {
+  const token = z.string().min(20).max(128).regex(/^[A-Za-z0-9_-]+$/).parse(trackingToken);
+  const pointer = await prisma.order.findUnique({ where: { trackingToken: token }, select: { id: true } });
+  if (!pointer) throw new NotFoundError("Order not found");
+  const result = await prisma.$transaction((tx) => cancelOrderLocked(tx, pointer.id, null, "Cancelled by customer", undefined, token));
+  return { changed: result.changed, stockReleased: result.stockReleased };
 }
 
 export async function cancelOrder(orderId: string, actorId: string, reason: string) {
@@ -924,20 +1009,22 @@ export type PendingCourierClaim = {
   orderStatusAtClaim: OrderStatus; request: CourierRequest; requestFingerprint: string; configurationMac: string;
 };
 
-function isOurClaim(
-  shipment: { orderId: string; providerCode: string; status: string; codAmount: number; payload: Prisma.JsonValue },
-  claim: PendingCourierClaim, state: "AWAITING_RESULT" | "BOOKED",
-) {
+type CourierClaimRecord = { orderId: string; providerCode: string; status: string; codAmount: number; payload: Prisma.JsonValue };
+function matchesClaimIdentity(shipment: CourierClaimRecord, claim: PendingCourierClaim) {
   const marker = courierClaimMarkerSchema.safeParse(shipment.payload);
   return shipment.orderId === claim.orderId && shipment.providerCode === claim.providerCode
-    && shipment.status === (state === "BOOKED" ? "BOOKED" : "PENDING")
     && shipment.codAmount === claim.request.codAmount && marker.success
-    && marker.data.landiqBooking.state === state
     && marker.data.landiqBooking.sandbox === claim.request.sandbox
     && marker.data.landiqBooking.merchantReference === claim.request.orderNumber
     && marker.data.landiqBooking.orderStatusAtClaim === claim.orderStatusAtClaim
     && marker.data.landiqBooking.requestFingerprint === claim.requestFingerprint
     && marker.data.landiqBooking.configurationMac === claim.configurationMac;
+}
+
+function isOurClaim(shipment: CourierClaimRecord, claim: PendingCourierClaim, state: "AWAITING_RESULT" | "BOOKED") {
+  const marker = courierClaimMarkerSchema.safeParse(shipment.payload);
+  return matchesClaimIdentity(shipment, claim) && shipment.status === (state === "BOOKED" ? "BOOKED" : "PENDING")
+    && marker.success && marker.data.landiqBooking.state === state;
 }
 
 /** Best effort only: if this write also fails, the original PENDING claim still blocks retries and stock release. */
@@ -948,10 +1035,20 @@ async function markCourierOutcomeUnknown(claim: PendingCourierClaim, evidence: C
     if (!shipment || !isOurClaim(shipment, claim, "AWAITING_RESULT")) return;
     const state = evidence ? "RECONCILIATION_REQUIRED" : "OUTCOME_UNKNOWN";
     const response = evidence?.raw ?? raw;
+    const previous = shipment.payload as Prisma.JsonObject;
+    // A damaged or pre-existing report is still evidence. If normal
+    // finalization failed, never overwrite it in the best-effort fallback.
+    if (previous.conflictingProviderResult !== undefined || previous.additionalProviderResults !== undefined
+      || previous.providerResponse !== undefined || shipment.consignmentId || shipment.trackingId) {
+      throw new ConflictError("Existing courier evidence requires investigation before annotating this claim");
+    }
+    const staffRejection = previous.landiqStaffRejection !== undefined;
     await tx.courierShipment.update({ where: { id: shipment.id }, data: {
       ...(evidence ? { consignmentId: evidence.consignmentId, trackingId: evidence.trackingId,
         trackingUrl: evidence.trackingUrl ?? null, cost: evidence.cost ?? 0 } : {}),
-      payload: courierClaimPayload(claim, state, response),
+      payload: { ...previous, ...courierClaimPayload(claim, state, response),
+        ...(staffRejection && evidence ? { conflictingProviderResult: { consignmentId: evidence.consignmentId,
+          trackingId: evidence.trackingId, trackingUrl: evidence.trackingUrl ?? null, cost: evidence.cost ?? 0, raw: evidence.raw } } : {}) } as Prisma.InputJsonObject,
     } });
     await tx.courierTrackingEvent.create({ data: { shipmentId: shipment.id, status: "PENDING", source: "SYSTEM",
       description: "Courier outcome requires reconciliation. Do not retry or release stock.", raw: response ?? {} } });
@@ -966,6 +1063,38 @@ export async function finalizeCourierBooking(claim: PendingCourierClaim, rawBook
   return prisma.$transaction(async (tx) => {
     await lockOrder(tx, claim.orderId);
     const shipment = await tx.courierShipment.findUniqueOrThrow({ where: { id: claim.shipmentId } });
+    const existingPayload = shipment.payload && typeof shipment.payload === "object" && !Array.isArray(shipment.payload)
+      ? shipment.payload as Prisma.JsonObject : {};
+    const hasStaffRejection = existingPayload.landiqStaffRejection !== undefined;
+    const hasPriorConflict = existingPayload.conflictingProviderResult !== undefined || existingPayload.additionalProviderResults !== undefined;
+    if (shipment.status === "PENDING" && matchesClaimIdentity(shipment, claim) && (hasStaffRejection || hasPriorConflict)) {
+      // A success arriving after a staff rejection or existing conflicting
+      // evidence must never silently clear or overwrite any earlier report.
+      const payload = existingPayload;
+      const conflicting = { consignmentId: booking.consignmentId, trackingId: booking.trackingId,
+        trackingUrl: booking.trackingUrl ?? null, cost: booking.cost ?? 0, raw: booking.raw };
+      if (isDeepStrictEqual(payload.conflictingProviderResult, conflicting)) return { shipment, safe: false };
+      const firstConflict = payload.conflictingProviderResult;
+      const additional = payload.additionalProviderResults;
+      if ((firstConflict !== undefined && (!firstConflict || typeof firstConflict !== "object" || Array.isArray(firstConflict)))
+        || (additional !== undefined && !Array.isArray(additional))) throw new ConflictError("Malformed late-result history requires investigation");
+      if (additional?.some((result) => isDeepStrictEqual(result, conflicting))) return { shipment, safe: false };
+      const original = courierRawSchema.safeParse(payload.providerResponse);
+      if (original.success && shipment.consignmentId === booking.consignmentId && shipment.trackingId === booking.trackingId
+        && shipment.trackingUrl === (booking.trackingUrl ?? null) && shipment.cost === (booking.cost ?? 0)
+        && isDeepStrictEqual(original.data, booking.raw)) return { shipment, safe: false };
+      const marker = courierClaimMarkerSchema.parse(payload);
+      const updated = await tx.courierShipment.update({ where: { id: shipment.id }, data: {
+        status: "PENDING", payload: { ...payload, landiqBooking: { ...marker.landiqBooking, state: "RECONCILIATION_REQUIRED" },
+          ...(firstConflict !== undefined ? { additionalProviderResults: [...(additional ?? []), conflicting] }
+            : { conflictingProviderResult: conflicting }) } as Prisma.InputJsonObject,
+      } });
+      await tx.courierTrackingEvent.create({ data: { shipmentId: shipment.id, status: "PENDING", source: "API",
+        description: "A late booking response conflicts with existing evidence; investigate every report.", raw: booking.raw } });
+      await tx.auditLog.create({ data: { actorId: claim.actorId, action: "COURIER_RECONCILIATION_REQUIRED", entity: "CourierShipment",
+        entityId: shipment.id, after: { orderId: claim.orderId, conflicting: true } } });
+      return { shipment: updated, safe: false };
+    }
     const previouslyBooked = isOurClaim(shipment, claim, "BOOKED");
     if (!previouslyBooked && !isOurClaim(shipment, claim, "AWAITING_RESULT")) {
       const staffResolution = z.object({ landiqStaffResolution: z.object({ kind: z.literal("BOOKING_RECORDED") }) }).safeParse(shipment.payload);
@@ -1054,6 +1183,9 @@ export async function finalizeCourierBooking(claim: PendingCourierClaim, rawBook
     const state = safe ? "BOOKED" : "RECONCILIATION_REQUIRED";
     const priorResponse = priorPayload.success ? priorPayload.data.providerResponse : undefined;
     const payload = previouslyBooked ? {
+      // Preserve staff provenance and any other existing evidence when a
+      // later provider response changes a booked claim to reconciliation.
+      ...existingPayload,
       ...courierClaimPayload(claim, state, priorResponse),
       ...(!exactResponse ? { conflictingProviderResult: { consignmentId: booking.consignmentId, trackingId: booking.trackingId,
         trackingUrl: booking.trackingUrl ?? null, cost: booking.cost ?? 0, raw: booking.raw } } : {}),
@@ -1304,7 +1436,7 @@ export async function getOrderByTrackingToken(token: string) {
     where: { trackingToken: token },
     select: {
       id: true, orderNumber: true, createdAt: true, status: true, total: true,
-      paymentMethod: true, deliveryOption: true, expectedDeliveryAt: true, district: true, area: true,
+      paymentMethod: true, paymentStatus: true, deliveryOption: true, expectedDeliveryAt: true, district: true, area: true,
       items: { select: { name: true, quantity: true } },
       product: { select: { name: true, slug: true, images: { take: 1, orderBy: { position: "asc" } } } },
       statusHistory: {

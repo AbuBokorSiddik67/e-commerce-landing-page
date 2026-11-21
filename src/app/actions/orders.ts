@@ -8,7 +8,7 @@ import {
   settleCod, syncCourierTracking, updateOrderStatus,
 } from "@/services/orders";
 import { assignOwnDelivery, recordOwnDeliveryEvent } from "@/services/own-delivery";
-import { reconcileCourierBooking, reconcileCourierCancellation, requestCourierCancellation } from "@/services/courier-operations";
+import { recordCourierRejectionEvidence, reconcileCourierBooking, reconcileCourierCancellation, requestCourierCancellation } from "@/services/courier-operations";
 import { bool, finish, num, str } from "./helpers";
 
 function path(id: string) { return `/dashboard/orders/${id}`; }
@@ -89,6 +89,20 @@ export async function reconcileCourierBookingAction(formData: FormData) {
       consignmentId: str(formData, "consignmentId"), trackingId: str(formData, "trackingId"),
       sandbox: environment === "sandbox", evidence: str(formData, "evidence"), confirmOriginalAccount: true }, user.id);
   }, "Staff booking evidence recorded; goods are not automatically returned");
+}
+
+export async function recordCourierRejectionAction(formData: FormData) {
+  const user = await requirePermission(PERMISSIONS.ORDER_WRITE);
+  const id = str(formData, "id");
+  await finish(path(id), async () => {
+    if (!bool(formData, "confirmOriginalAccount") || !bool(formData, "confirmDefinitiveRejection")) {
+      throw new Error("Confirm the original account and a request-specific rejection, not an empty lookup");
+    }
+    const environment = str(formData, "environment");
+    if (!["sandbox", "live"].includes(environment)) throw new Error("Choose the original provider environment");
+    return recordCourierRejectionEvidence({ shipmentId: str(formData, "shipmentId"), merchantReference: str(formData, "merchantReference"),
+      sandbox: environment === "sandbox", evidence: str(formData, "evidence"), confirmOriginalAccount: true, confirmDefinitiveRejection: true }, user.id);
+  }, "Staff-reported rejection recorded. The claim remains blocked and stock unchanged.");
 }
 
 export async function requestCourierCancellationAction(formData: FormData) {

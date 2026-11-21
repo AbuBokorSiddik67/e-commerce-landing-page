@@ -27,6 +27,9 @@ const nextConfig: NextConfig = {
     return [
       { source: "/:path*", headers: securityHeaders },
       { source: "/p/:path*", headers: [{ key: "X-Robots-Tag", value: "index, follow, max-snippet:-1" }] },
+      // These URLs carry private tracking capabilities, not shareable order IDs.
+      { source: "/order-confirmed", headers: [{ key: "Referrer-Policy", value: "no-referrer" }, { key: "Cache-Control", value: "private, no-store" }] },
+      { source: "/track/:path*", headers: [{ key: "Referrer-Policy", value: "no-referrer" }, { key: "Cache-Control", value: "private, no-store" }] },
     ];
   },
 };

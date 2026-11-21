@@ -139,6 +139,31 @@ describe("current-writer courier and cancellation races", () => {
     expect(store.order.status).toBe("CANCELLED"); expect(store.stock).toBe(4);
   });
 
+  it("does not overwrite existing conflicting evidence when finalization and its fallback fail", async () => {
+    mocks.createShipment.mockImplementationOnce(async () => {
+      store.shipment!.payload.landiqStaffRejection = null;
+      store.shipment!.payload.conflictingProviderResult = { consignmentId: "prior-consignment", trackingId: "prior-tracking" };
+      return { consignmentId: "late-consignment", trackingId: "late-tracking", raw: { accepted: true } };
+    });
+    const update = vi.spyOn(tx.courierShipment, "update").mockRejectedValueOnce(new Error("synthetic finalization failure"));
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      await expect(bookCourierShipment("order-1", "fixture", "manager")).rejects.toThrow(/may have been created/);
+      expect(update).toHaveBeenCalledOnce();
+      expect(mocks.transaction).toHaveBeenCalledTimes(3);
+      await expect(mocks.transaction.mock.results[2].value).rejects.toMatchObject({
+        code: "CONFLICT", status: 409, message: "Existing courier evidence requires investigation before annotating this claim",
+      });
+      expect(log).toHaveBeenCalledWith("Could not annotate an unresolved courier claim", expect.any(Object));
+      expect(store.shipment?.status).toBe("PENDING");
+      expect(store.shipment?.payload).toMatchObject({ landiqStaffRejection: null,
+        conflictingProviderResult: { consignmentId: "prior-consignment", trackingId: "prior-tracking" } });
+      expect(store.shipment?.consignmentId).toBeNull();
+      expect(mocks.createShipment).toHaveBeenCalledOnce();
+      expect(store.stock).toBe(4);
+    } finally { update.mockRestore(); log.mockRestore(); }
+  });
+
   it("does not issue duplicate bookings from simultaneous submissions", async () => {
     const called = deferred(); const release = deferred();
     mocks.createShipment.mockImplementationOnce(async () => { called.resolve(); await release.promise;
