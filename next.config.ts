@@ -20,6 +20,8 @@ const securityHeaders = [
 const nextConfig: NextConfig = {
   reactStrictMode: true,
   poweredByHeader: false,
+  // The media form allows 20 MiB files; leave room for multipart overhead.
+  experimental: { serverActions: { bodySizeLimit: "25mb" } },
   images: {
     remotePatterns: [{ protocol: "https", hostname: "**" }],
   },
@@ -27,9 +29,10 @@ const nextConfig: NextConfig = {
     return [
       { source: "/:path*", headers: securityHeaders },
       { source: "/p/:path*", headers: [{ key: "X-Robots-Tag", value: "index, follow, max-snippet:-1" }] },
-      // These URLs carry private tracking capabilities, not shareable order IDs.
+      // These URLs carry private tracking or password-reset capabilities.
       { source: "/order-confirmed", headers: [{ key: "Referrer-Policy", value: "no-referrer" }, { key: "Cache-Control", value: "private, no-store" }] },
       { source: "/track/:path*", headers: [{ key: "Referrer-Policy", value: "no-referrer" }, { key: "Cache-Control", value: "private, no-store" }] },
+      { source: "/reset-password", headers: [{ key: "Referrer-Policy", value: "no-referrer" }, { key: "Cache-Control", value: "private, no-store" }] },
     ];
   },
 };

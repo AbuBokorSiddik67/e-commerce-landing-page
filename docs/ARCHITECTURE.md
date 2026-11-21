@@ -19,7 +19,7 @@ LANDIQ is a Single-Tenant Modular Monolith. Every installation has its own datab
 
 **Public order:** `/p/[slug]` renders published sections and passes the server-computed list of available payment methods into the checkout form. `POST /api/orders` validates again, re-checks method availability, calculates delivery server-side, atomically decrements stock with `updateMany({ stock: { gte: qty } })`, records stock movement and returns either an order confirmation token or the provider redirect URL.
 
-**Payment callback:** `/api/payments/[provider]/callback` (or `/ipn`) → adapter calls the provider's verification/query API → transaction lookup → amount check → idempotent `verifiedAt` claim → order payment/financial update → audit + notification + optional CAPI Purchase event. Frontend redirects are never trusted as proof of payment.
+**Payment callback:** `/api/payments/[provider]/callback` (or `/ipn`) uses a request reference to locate a known transaction, then asks the provider to verify it. A paid result requires exact reference, amount and currency, followed by locked local evidence checks; ambiguous results remain for reconciliation. A diagnostic webhook row is not the source of truth, and frontend redirects are never proof of payment. Live adapters are unverified.
 
 **Tracking:** `/track/[token]` queries an explicit allow-list of fields, rate-limits by IP, masks the phone number and never renders the street address or internal notes.
 

@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { checkRateLimit } from "@/lib/rate-limit";
 import { assertSameOrigin } from "@/lib/http";
-import { AppError, toErrorMessage } from "@/lib/errors";
+import { AppError } from "@/lib/errors";
+import { ZodError } from "zod";
 import { submitReview } from "@/services/reviews";
 import { headers } from "next/headers";
 
@@ -15,6 +16,8 @@ export async function POST(request: Request) {
     const review = await submitReview(body);
     return NextResponse.json({ ok: true, status: review.status }, { status: 201 });
   } catch (error) {
-    return NextResponse.json({ error: toErrorMessage(error) }, { status: error instanceof AppError ? error.status : 400 });
+    if (error instanceof AppError) return NextResponse.json({ error: error.message }, { status: error.status });
+    if (error instanceof ZodError || error instanceof SyntaxError) return NextResponse.json({ error: "Invalid review details" }, { status: 400 });
+    return NextResponse.json({ error: "Unable to submit review" }, { status: 500 });
   }
 }

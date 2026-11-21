@@ -4,30 +4,35 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: landiq
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-this-password}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set a random hexadecimal POSTGRES_PASSWORD in .env}
       POSTGRES_DB: landiq
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U landiq"]
+      test: ["CMD-SHELL", "pg_isready -U landiq -d landiq"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   app:
-    build: .
+    build:
+      context: .
+      args:
+        NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:?Set the public site origin in .env}
     restart: unless-stopped
     depends_on:
       db:
         condition: service_healthy
+    env_file: .env
     environment:
-      DATABASE_URL: postgresql://landiq:${POSTGRES_PASSWORD:-change-this-password}@db:5432/landiq?schema=public
-      NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:-http://localhost:3000}
-      CREDENTIALS_ENCRYPTION_KEY: ${CREDENTIALS_ENCRYPTION_KEY:?Set a long random key in .env}
-      STORAGE_DRIVER: ${STORAGE_DRIVER:-local}
-    ports:
-      - "3000:3000"
+      # Generate POSTGRES_PASSWORD as hex so it is also safe in a URL.
+      DATABASE_URL: postgresql://landiq:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@db:5432/landiq
+      NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:?Set the public site origin}
+      CREDENTIALS_ENCRYPTION_KEY: ${CREDENTIALS_ENCRYPTION_KEY:?Set a random key of at least 32 bytes}
+    # Only Nginx is publicly exposed. Both mounts use the same volume to keep
+    # earlier /uploads URLs working after moving new files out of public/.
     volumes:
+      - uploads:/app/storage/uploads
       - uploads:/app/public/uploads
 
   nginx:

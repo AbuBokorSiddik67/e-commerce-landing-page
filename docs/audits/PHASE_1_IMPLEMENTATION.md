@@ -1,5 +1,7 @@
 # LANDIQ Phase 1 — final verification and closure
 
+> **Historical snapshot:** The newer review added an additive migration and synthetic migration tests, but did not verify the official CLI or any existing installation. Three mixed-version writer safety assertions still fail; overlap during an actual upgrade or rollback is unsafe and must be independently fenced and reconciled. See [current deployment readiness](../DEPLOYMENT.md) and [testing](../TESTING.md) for the latest results.
+
 ## Decision: FAIL
 
 **Phase 1 is not closed or deployable.** The new disposable PostgreSQL and browser checks passed within their stated scope, but the proposed migration has not been executed or checked against existing data, the native production build fails during the official Prisma engine download, and authoritative provider recovery remains unverified. Checkout idempotency is conditional on retaining a keyed operation; the old unkeyed API path is not durable. See the exact blockers below. Do not deploy or start Phase 2 on the strength of these results.

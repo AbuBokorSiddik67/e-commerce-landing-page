@@ -1,9 +1,12 @@
 import { expect, test } from "@playwright/test";
 
 test("owner can log in and see the dashboard", async ({ page }) => {
+  const email = process.env.E2E_OWNER_EMAIL;
+  const password = process.env.E2E_OWNER_PASSWORD;
+  if (!email || !password) throw new Error("Set dedicated E2E_OWNER_EMAIL and E2E_OWNER_PASSWORD for the disposable database");
   await page.goto("/login");
-  await page.getByLabel("Email address").fill("owner@landiq.local");
-  await page.getByLabel("Password").fill("Owner@123456789");
+  await page.getByLabel("Email address").fill(email);
+  await page.getByLabel("Password").fill(password);
   await page.getByRole("button", { name: /sign in/i }).click();
   await expect(page).toHaveURL(/\/dashboard/);
   await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();

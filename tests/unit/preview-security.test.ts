@@ -20,4 +20,14 @@ describe("preview embedding", () => {
     expect(await frameHeader("development", "0")).toBe("SAMEORIGIN");
     expect(await frameHeader("production", "1")).toBe("SAMEORIGIN");
   });
+
+  it("prevents referrer and shared-cache leaks from capability URLs", async () => {
+    const { default: config } = await import("../../next.config");
+    const rules = await config.headers!();
+    for (const source of ["/order-confirmed", "/track/:path*", "/reset-password"]) {
+      const headers = rules.find((rule) => rule.source === source)?.headers;
+      expect(headers).toContainEqual({ key: "Referrer-Policy", value: "no-referrer" });
+      expect(headers).toContainEqual({ key: "Cache-Control", value: "private, no-store" });
+    }
+  });
 });

@@ -22,15 +22,11 @@ export const sslcommerzProvider: PaymentProvider = {
   requiredCredentials: ["storeId", "storePassword"],
   credentialsValid: (c) => Boolean(c.storeId?.trim() && c.storePassword?.trim()),
 
-  async testConnection(credentials, sandbox) {
+  async testConnection(credentials) {
     if (!this.credentialsValid(credentials)) return { ok: false, message: "Store ID and store password are required" };
-    // A harmless validation lookup; an invalid credential pair returns a failed status.
-    const result = await postJson<SslResponse>(
-      `${base(sandbox)}/validate/v2/validate.php`,
-      { store_id: credentials.storeId, store_passwd: credentials.storePassword, val_id: "TEST", v: 1, format: "json" },
-    );
-    const message = result.message ?? result.error ?? JSON.stringify(result);
-    return { ok: /invalid|validation/i.test(message) === false && result.status !== "FAILED", message };
+    // A made-up validation ID cannot prove that an account was authenticated.
+    // Require a real sandbox checkout instead of presenting a false success.
+    return { ok: false, message: "A real sandbox checkout is required to verify SSLCommerz credentials" };
   },
 
   async initialize(input) {
@@ -62,7 +58,7 @@ export const sslcommerzProvider: PaymentProvider = {
       item_category: "General",
     });
     if (result.status !== "VALID" || !result.gatewayPageURL) {
-      throw new Error(result.error ?? `SSLCommerz initialization failed: ${JSON.stringify(result)}`);
+      throw new Error("SSLCommerz initialization failed");
     }
     return { reference: result.tran_id ?? tran_id, checkoutUrl: result.gatewayPageURL, status: "INITIATED", raw: result };
   },

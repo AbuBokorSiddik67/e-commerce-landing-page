@@ -1,7 +1,7 @@
 "use client";
 import { useActionState } from "react";
 import Link from "next/link";
-import { loginAction, requestResetAction, resetPasswordAction } from "@/app/actions/auth";
+import { changePasswordAction, loginAction, requestResetAction, resetPasswordAction } from "@/app/actions/auth";
 import { Button, Field } from "@/components/ui";
 
 export function LoginForm() {
@@ -35,8 +35,21 @@ export function ResetPasswordForm({ token }: { token: string }) {
     <form action={action} className="space-y-4">
       <input type="hidden" name="token" value={token} />
       {state?.error && <div className="alert-error">{state.error}</div>}
-      <Field label="New password" name="password" required hint="At least 10 characters"><input className="input" type="password" name="password" minLength={10} required /></Field>
+      <Field label="New password" name="password" required hint="At least 10 characters, at most 72 UTF-8 bytes"><input className="input" type="password" name="password" minLength={10} autoComplete="new-password" required /></Field>
       <Button disabled={pending} className="w-full">{pending ? "Saving…" : "Set new password"}</Button>
+    </form>
+  );
+}
+
+export function ChangePasswordForm() {
+  const [state, action, pending] = useActionState(changePasswordAction, undefined);
+  return (
+    <form action={action} className="space-y-4">
+      {state?.error && <div className="alert-error" role="alert">{state.error}</div>}
+      {state?.message && <div className="alert-success" role="status">{state.message} <Link className="underline" href="/dashboard">Continue to dashboard</Link></div>}
+      <Field label="Current password" name="currentPassword" required><input id="currentPassword" className="input" type="password" name="currentPassword" autoComplete="current-password" required /></Field>
+      <Field label="New password" name="newPassword" required hint="At least 10 characters, at most 72 UTF-8 bytes"><input id="newPassword" className="input" type="password" name="newPassword" autoComplete="new-password" minLength={10} required /></Field>
+      <Button disabled={pending} className="w-full">{pending ? "Saving…" : "Change password"}</Button>
     </form>
   );
 }

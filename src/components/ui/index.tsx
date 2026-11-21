@@ -30,11 +30,13 @@ export function Badge({ children, tone = "neutral", className }: {
   return <span className={cn("badge", tones[tone], className)}>{children}</span>;
 }
 
-export function Field({ label, name, hint, children, required }: {
+export function Field({ label, hint, children, required }: {
   label: string; name: string; hint?: string; children: ReactNode; required?: boolean;
 }) {
   return (
-    <label htmlFor={name} className="block">
+    // The control is nested inside the label. Some callers intentionally omit
+    // an id, so an htmlFor pointing at a missing id would break association.
+    <label className="block">
       <span className="label">{label}{required && <span className="ml-0.5 text-red-500">*</span>}</span>
       {children}
       {hint && <span className="mt-1 block text-xs text-ink-400">{hint}</span>}

@@ -4,12 +4,10 @@ const ALGORITHM = "aes-256-gcm";
 
 function encryptionKey() {
   const configured = process.env.CREDENTIALS_ENCRYPTION_KEY;
-  if (!configured) {
-    if (process.env.NODE_ENV === "production") {
-      throw new Error("CREDENTIALS_ENCRYPTION_KEY must be set in production");
-    }
-    return createHash("sha256").update("landiq-development-only-key").digest();
+  if (process.env.NODE_ENV === "production" && (!configured || Buffer.byteLength(configured, "utf8") < 32)) {
+    throw new Error("CREDENTIALS_ENCRYPTION_KEY must be at least 32 bytes in production");
   }
+  if (!configured) return createHash("sha256").update("landiq-development-only-key").digest();
   // Derive a stable 32-byte key from whatever long secret the operator supplied.
   return createHash("sha256").update(configured).digest();
 }

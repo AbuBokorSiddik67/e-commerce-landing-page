@@ -63,31 +63,52 @@ export async function setSetting(key: string, value: unknown) {
   await prisma.setting.upsert({ where: { key }, create: { key, value: value as never }, update: { value: value as never } });
 }
 
+function storedCredentials(raw: unknown): Record<string, string> {
+  if (raw == null) return {};
+  if (typeof raw !== "object" || Array.isArray(raw)) throw new ConflictError("Stored provider credentials are invalid; operator review is required");
+  const entries = Object.entries(raw);
+  if (entries.some(([, value]) => typeof value !== "string")) throw new ConflictError("Stored provider credentials are invalid; operator review is required");
+  return Object.fromEntries(entries) as Record<string, string>;
+}
+
 function decodeCredentials(raw: unknown): Record<string, string> {
-  const source = (raw ?? {}) as Record<string, string>;
   const result: Record<string, string> = {};
-  for (const [key, value] of Object.entries(source)) {
-    if (value?.startsWith("enc:")) {
+  for (const [key, value] of Object.entries(storedCredentials(raw))) {
+    if (value.startsWith("enc:")) {
       try {
         result[key] = decryptSecret(value.slice(4));
       } catch {
-        result[key] = "";
+        // Do not silently replace unreadable values with empty strings or fall
+        // back to another account. That can lose secrets and misroute calls.
+        throw new ConflictError("Stored provider credentials cannot be decrypted; check the original encryption key and restore plan");
       }
     } else {
-      result[key] = value ?? "";
+      result[key] = value; // legacy plaintext is encrypted on the next save
     }
   }
   return result;
 }
 
 function encodeCredentials(current: unknown, patch: Record<string, unknown>, fields: readonly string[]) {
-  const result: Record<string, string> = { ...decodeCredentials(current) };
+  const stored = storedCredentials(current);
+  const decoded = decodeCredentials(stored); // fail without writing if the key is wrong
+  const result: Record<string, string> = {};
+  for (const [field, value] of Object.entries(stored)) {
+    // Preserve untouched ciphertext exactly: courier claims bind the stored
+    // representation as well as the account. Never write decoded secrets back.
+    result[field] = value.startsWith("enc:") ? value : decoded[field] ? `enc:${encryptSecret(decoded[field])}` : "";
+  }
   for (const field of fields) {
     if (patch[field] === undefined) continue;
     const value = String(patch[field] ?? "");
     result[field] = value ? `enc:${encryptSecret(value)}` : "";
   }
   return result;
+}
+
+function configurationAuditBefore(existing: { code: string; enabled: boolean; visible: boolean; sandbox: boolean; isDefault: boolean; status: string } | null) {
+  return existing && { code: existing.code, enabled: existing.enabled, visible: existing.visible, sandbox: existing.sandbox,
+    isDefault: existing.isDefault, status: existing.status, credentials: "[redacted]" };
 }
 
 function envFallback(prefix: string, key: string) {
@@ -125,9 +146,15 @@ export async function getCheckoutPaymentMethods(): Promise<PublicPaymentMethod[]
     }
     const provider = getPaymentProvider(config.code);
     if (!provider) continue;
-    const credentials = withEnvFallback(decodeCredentials(config.credentials), config.code.toUpperCase(), provider.requiredCredentials);
-    if (!provider.credentialsValid(credentials)) continue;
-    methods.push({ code: config.code, name: config.name, isDefault: config.isDefault, sandbox: config.sandbox });
+    try {
+      const credentials = withEnvFallback(decodeCredentials(config.credentials), config.code.toUpperCase(), provider.requiredCredentials);
+      if (!provider.credentialsValid(credentials)) continue;
+      methods.push({ code: config.code, name: config.name, isDefault: config.isDefault, sandbox: config.sandbox });
+    } catch {
+      // An unreadable provider must not hide unrelated methods such as COD or
+      // silently switch to environment credentials for another account.
+      continue;
+    }
   }
   return methods;
 }
@@ -144,11 +171,14 @@ export async function getPaymentConfigurations() {
   return PAYMENT_PROVIDER_INFO.map((info) => {
     const row = rows.find((r) => r.code === info.code);
     let configured = info.code === "cod";
+    let credentialError = false;
     if (info.code !== "cod") {
       const provider = getPaymentProvider(info.code);
       if (provider) {
-        const credentials = withEnvFallback(decodeCredentials(row?.credentials), info.code.toUpperCase(), provider.requiredCredentials);
-        configured = provider.credentialsValid(credentials);
+        try {
+          const credentials = withEnvFallback(decodeCredentials(row?.credentials), info.code.toUpperCase(), provider.requiredCredentials);
+          configured = provider.credentialsValid(credentials);
+        } catch { credentialError = true; }
       }
     }
     return {
@@ -161,9 +191,11 @@ export async function getPaymentConfigurations() {
       sandbox: row?.sandbox ?? true,
       isDefault: row?.isDefault ?? info.code === "cod",
       configured,
-      status: configured ? (row?.status ?? "configured") : "unconfigured",
+      status: credentialError ? "credential_error" : configured ? (row?.status ?? "configured") : "unconfigured",
       lastTestedAt: row?.lastTestedAt ?? null,
-      lastError: row?.lastError ?? null,
+      // Historical provider errors may contain echoed secrets.
+      lastError: credentialError ? "Stored credentials cannot be decrypted; operator review is required"
+        : row?.lastError ? "Last connection test failed; check provider configuration" : null,
     };
   });
 }
@@ -195,7 +227,7 @@ export async function updatePaymentConfiguration(code: string, patch: {
     update: data,
   });
   const { audit } = await import("./audit");
-  await audit({ actorId, action: "UPDATE_PAYMENT_METHOD", entity: "PaymentMethodConfiguration", entityId: config.id, before: existing, after: { code, ...data, credentials: "[redacted]" } });
+  await audit({ actorId, action: "UPDATE_PAYMENT_METHOD", entity: "PaymentMethodConfiguration", entityId: config.id, before: configurationAuditBefore(existing), after: { code, ...data, credentials: "[redacted]" } });
   return config;
 }
 
@@ -205,19 +237,22 @@ export async function testPaymentConnection(code: string) {
   if (!provider) throw new ConflictError("Unknown payment provider");
   const row = await prisma.paymentMethodConfiguration.findUnique({ where: { code } });
   const credentials = withEnvFallback(decodeCredentials(row?.credentials), code.toUpperCase(), provider.requiredCredentials);
-  try {
-    const result = await provider.testConnection(credentials as PaymentCredentials, row?.sandbox ?? true);
-    await prisma.paymentMethodConfiguration.upsert({
-      where: { code },
-      create: { code, name: provider.name, status: result.ok ? "connected" : "failed", lastTestedAt: new Date(), lastError: result.ok ? null : result.message },
-      update: { status: result.ok ? "connected" : "failed", lastTestedAt: new Date(), lastError: result.ok ? null : result.message },
-    });
-    return result;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Connection test failed";
-    await prisma.paymentMethodConfiguration.update({ where: { code }, data: { status: "failed", lastTestedAt: new Date(), lastError: message } });
-    return { ok: false, message };
-  }
+  // Adapter messages and thrown network errors can echo credentials. Do not
+  // save or reflect them. A local RSA check is not a provider connection.
+  let ok = false;
+  try { ok = (await provider.testConnection(credentials as PaymentCredentials, row?.sandbox ?? true)).ok; }
+  catch { /* reported as a generic failure below */ }
+  const status = code === "sslcommerz" && provider.credentialsValid(credentials) ? "unverified"
+    : ok && code === "nagad" ? "credentials_checked" : ok ? "connected" : "failed";
+  const message = status === "unverified" ? "A real SSLCommerz sandbox checkout is required to verify these credentials"
+    : status === "credentials_checked" ? "RSA keys checked locally; the provider connection is not verified"
+      : ok ? "Connection check completed; verify a real sandbox transaction"
+        : "Connection check failed; review the configuration and network";
+  const data = { status, lastTestedAt: new Date(), lastError: ok ? null : message };
+  await prisma.paymentMethodConfiguration.upsert({
+    where: { code }, create: { code, name: provider.name, ...data }, update: data,
+  });
+  return { ok, message };
 }
 
 export type PublicCourier = { code: string; name: string; isDefault: boolean };
@@ -228,9 +263,11 @@ export async function getCheckoutCouriers(): Promise<PublicCourier[]> {
   for (const row of rows) {
     const provider = getCourierProvider(row.code);
     if (!provider) continue;
-    const credentials = withEnvFallback(decodeCredentials(row.credentials), row.code.toUpperCase(), provider.requiredCredentials);
-    if (!provider.credentialsValid(credentials)) continue;
-    result.push({ code: row.code, name: row.name, isDefault: row.isDefault });
+    try {
+      const credentials = withEnvFallback(decodeCredentials(row.credentials), row.code.toUpperCase(), provider.requiredCredentials);
+      if (!provider.credentialsValid(credentials)) continue;
+      result.push({ code: row.code, name: row.name, isDefault: row.isDefault });
+    } catch { continue; }
   }
   return result;
 }
@@ -240,14 +277,20 @@ export async function getCourierConfigurations() {
   return COURIER_PROVIDER_INFO.map((info) => {
     const row = rows.find((r) => r.code === info.code);
     const provider = getCourierProvider(info.code);
-    const credentials = row ? withEnvFallback(decodeCredentials(row.credentials), info.code.toUpperCase(), provider?.requiredCredentials ?? []) : {};
-    const configured = Boolean(provider && provider.credentialsValid(credentials));
+    let configured = false;
+    let credentialError = false;
+    try {
+      const credentials = row ? withEnvFallback(decodeCredentials(row.credentials), info.code.toUpperCase(), provider?.requiredCredentials ?? []) : {};
+      configured = Boolean(provider && provider.credentialsValid(credentials));
+    } catch { credentialError = true; }
     return {
       code: info.code, name: info.name, fields: info.fields,
       enabled: row?.enabled ?? false, visible: row?.visible ?? false,
       sandbox: row?.sandbox ?? true, isDefault: row?.isDefault ?? false,
-      configured, status: configured ? (row?.status ?? "configured") : "unconfigured",
-      lastTestedAt: row?.lastTestedAt ?? null, lastError: row?.lastError ?? null,
+      configured, status: credentialError ? "credential_error" : configured ? (row?.status ?? "configured") : "unconfigured",
+      lastTestedAt: row?.lastTestedAt ?? null,
+      lastError: credentialError ? "Stored credentials cannot be decrypted; operator review is required"
+        : row?.lastError ? "Last connection test failed; check provider configuration" : null,
     };
   });
 }
@@ -274,7 +317,7 @@ export async function updateCourierConfiguration(code: string, patch: {
     where: { code }, create: { code, name: info.name, ...data }, update: data,
   });
   const { audit } = await import("./audit");
-  await audit({ actorId, action: "UPDATE_COURIER", entity: "CourierProviderConfiguration", entityId: config.id, before: existing, after: { code, ...data, credentials: "[redacted]" } });
+  await audit({ actorId, action: "UPDATE_COURIER", entity: "CourierProviderConfiguration", entityId: config.id, before: configurationAuditBefore(existing), after: { code, ...data, credentials: "[redacted]" } });
   return config;
 }
 
@@ -283,19 +326,16 @@ export async function testCourierConnection(code: string) {
   if (!provider) throw new ConflictError("Unknown courier");
   const row = await prisma.courierProviderConfiguration.findUnique({ where: { code } });
   const credentials = withEnvFallback(decodeCredentials(row?.credentials), code.toUpperCase(), provider.requiredCredentials);
-  try {
-    const result = await provider.testConnection(credentials as CourierCredentials, row?.sandbox ?? true);
-    await prisma.courierProviderConfiguration.upsert({
-      where: { code },
-      create: { code, name: provider.name, status: result.ok ? "connected" : "failed", lastTestedAt: new Date(), lastError: result.ok ? null : result.message },
-      update: { status: result.ok ? "connected" : "failed", lastTestedAt: new Date(), lastError: result.ok ? null : result.message },
-    });
-    return result;
-  } catch (error) {
-    const message = error instanceof Error ? error.message : "Connection test failed";
-    await prisma.courierProviderConfiguration.update({ where: { code }, data: { status: "failed", lastTestedAt: new Date(), lastError: message } });
-    return { ok: false, message };
-  }
+  let ok = false;
+  try { ok = (await provider.testConnection(credentials as CourierCredentials, row?.sandbox ?? true)).ok; }
+  catch { /* do not expose raw provider or network errors */ }
+  const message = ok ? "Connection check completed; verify a real sandbox shipment"
+    : "Connection check failed; review the configuration and network";
+  const data = { status: ok ? "connected" : "failed", lastTestedAt: new Date(), lastError: ok ? null : message };
+  await prisma.courierProviderConfiguration.upsert({
+    where: { code }, create: { code, name: provider.name, ...data }, update: data,
+  });
+  return { ok, message };
 }
 
 export type DeliveryQuote = { charge: number; ruleName: string };

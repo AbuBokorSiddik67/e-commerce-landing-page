@@ -1,11 +1,12 @@
 import "server-only";
 import bcrypt from "bcryptjs";
+import type { Prisma } from "@prisma/client";
 import { cookies, headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { prisma } from "./prisma";
 import { hashToken, randomToken } from "./crypto";
 import { checkRateLimit, resetRateLimit } from "./rate-limit";
-import { ForbiddenError, UnauthorizedError } from "./errors";
+import { ConflictError, ForbiddenError, UnauthorizedError } from "./errors";
 import { hasPermission, type PermissionKey } from "./permissions";
 import { audit } from "./audit";
 
@@ -19,6 +20,7 @@ export type AuthUser = {
   roles: string[];
   permissions: Set<PermissionKey>;
   sessionId: string;
+  mustResetPassword: boolean;
 };
 
 async function requestMeta() {
@@ -29,13 +31,25 @@ async function requestMeta() {
   };
 }
 
+type AuthSnapshot = { id: string; email: string; passwordHash: string; isActive: boolean };
+
+/** Serialize session/link creation with password changes and staff deactivation. */
+async function lockUnchangedActiveUser(tx: Prisma.TransactionClient, snapshot: AuthSnapshot) {
+  const rows = await tx.$queryRaw<Array<Pick<AuthSnapshot, "email" | "passwordHash" | "isActive">>>`
+    SELECT "email", "passwordHash", "isActive" FROM "User" WHERE id = ${snapshot.id} FOR UPDATE
+  `;
+  const current = rows[0];
+  return Boolean(current?.isActive && current.email === snapshot.email && current.passwordHash === snapshot.passwordHash);
+}
+
 export async function login(email: string, password: string) {
   const normalized = email.trim().toLowerCase();
   const meta = await requestMeta();
   const key = `login:${normalized}:${meta.ip ?? "unknown"}`;
   checkRateLimit(key, 8, 15 * 60 * 1000);
 
-  const user = await prisma.user.findUnique({ where: { email: normalized }, include: { roles: { include: { role: true } } } });
+  const user = await prisma.user.findUnique({ where: { email: normalized },
+    select: { id: true, email: true, passwordHash: true, isActive: true } });
   const valid = user ? await bcrypt.compare(password, user.passwordHash) : false;
   if (!user || !valid || !user.isActive) {
     await prisma.loginAttempt.create({
@@ -45,18 +59,28 @@ export async function login(email: string, password: string) {
   }
 
   const token = randomToken();
-  await prisma.session.create({
-    data: {
-      userId: user.id,
-      tokenHash: hashToken(token),
-      expiresAt: new Date(Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000),
-      ip: meta.ip,
-      userAgent: meta.userAgent,
-    },
+  const created = await prisma.$transaction(async (tx) => {
+    // bcrypt ran outside the lock. Recheck the exact hash, account and email
+    // after acquiring it so a concurrent reset/disable cannot revive a session.
+    if (!(await lockUnchangedActiveUser(tx, user))) {
+      await tx.loginAttempt.create({ data: { email: normalized, ip: meta.ip, success: false, reason: "account_changed" } });
+      return false;
+    }
+    await tx.session.create({
+      data: {
+        userId: user.id,
+        tokenHash: hashToken(token),
+        expiresAt: new Date(Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000),
+        ip: meta.ip,
+        userAgent: meta.userAgent,
+      },
+    });
+    await tx.loginAttempt.create({ data: { email: normalized, ip: meta.ip, success: true } });
+    await tx.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
+    await tx.auditLog.create({ data: { actorId: user.id, action: "LOGIN", entity: "User", entityId: user.id, ip: meta.ip } });
+    return true;
   });
-  await prisma.loginAttempt.create({ data: { email: normalized, ip: meta.ip, success: true } });
-  await prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
-  await audit({ actorId: user.id, action: "LOGIN", entity: "User", entityId: user.id, ip: meta.ip });
+  if (!created) throw new UnauthorizedError("Invalid email or password");
   resetRateLimit(key);
 
   (await cookies()).set(SESSION_COOKIE, token, {
@@ -98,6 +122,7 @@ export async function getCurrentUser(): Promise<AuthUser | null> {
     roles,
     permissions: permissionsForRoles(roles),
     sessionId: session.id,
+    mustResetPassword: session.user.mustResetPassword,
   };
 }
 
@@ -109,6 +134,7 @@ export async function requireUser() {
 
 export async function requirePermission(permission: PermissionKey) {
   const user = await requireUser();
+  if (user.mustResetPassword) redirect("/change-password");
   if (!user.permissions.has(permission)) throw new ForbiddenError();
   return user;
 }
@@ -119,6 +145,10 @@ export async function requirePageAccess(permission: PermissionKey, mode: "redire
     if (mode === "redirect") redirect("/login");
     throw new UnauthorizedError();
   }
+  if (user.mustResetPassword) {
+    if (mode === "redirect") redirect("/change-password");
+    throw new ForbiddenError("Change the temporary password before accessing the dashboard");
+  }
   if (!user.permissions.has(permission)) {
     if (mode === "redirect") redirect("/dashboard?error=forbidden");
     throw new ForbiddenError();
@@ -128,34 +158,62 @@ export async function requirePageAccess(permission: PermissionKey, mode: "redire
 
 /** One-time password reset token; only its hash is persisted. */
 export async function createPasswordResetToken(email: string) {
-  const user = await prisma.user.findUnique({ where: { email: email.trim().toLowerCase() } });
+  const normalized = email.trim().toLowerCase();
+  const meta = await requestMeta();
+  // Bound both total requests from an IP and requests for one address from
+  // that IP. This process-local limiter relies on a trusted reverse proxy.
+  checkRateLimit(`password-reset-ip:${meta.ip ?? "unknown"}`, 20, 60 * 60 * 1000);
+  checkRateLimit(`password-reset-account:${meta.ip ?? "unknown"}:${normalized}`, 3, 60 * 60 * 1000);
+  const user = await prisma.user.findUnique({ where: { email: normalized },
+    select: { id: true, email: true, passwordHash: true, isActive: true } });
   if (!user || !user.isActive) return null;
   const token = randomToken();
-  await prisma.passwordResetToken.create({
-    data: { userId: user.id, tokenHash: hashToken(token), expiresAt: new Date(Date.now() + 60 * 60 * 1000) },
+  const issued = await prisma.$transaction(async (tx) => {
+    // Do not issue an old request after a reset, email change or deactivation
+    // already revoked earlier links. The same user lock also orders a new link
+    // before revocation when this transaction wins the race.
+    if (!(await lockUnchangedActiveUser(tx, user))) return false;
+    await tx.passwordResetToken.create({
+      data: { userId: user.id, tokenHash: hashToken(token), expiresAt: new Date(Date.now() + 60 * 60 * 1000) },
+    });
+    await tx.auditLog.create({ data: { actorId: user.id, action: "PASSWORD_RESET_REQUESTED", entity: "User", entityId: user.id } });
+    return true;
   });
-  await audit({ actorId: user.id, action: "PASSWORD_RESET_REQUESTED", entity: "User", entityId: user.id });
-  return token;
+  return issued ? token : null;
 }
 
 export async function consumePasswordResetToken(token: string, newPassword: string) {
-  const record = await prisma.passwordResetToken.findUnique({ where: { tokenHash: hashToken(token) } });
-  if (!record || record.usedAt || record.expiresAt < new Date()) throw new Error("Invalid or expired reset link");
   const passwordHash = await bcrypt.hash(newPassword, 12);
-  await prisma.$transaction([
-    prisma.user.update({ where: { id: record.userId }, data: { passwordHash, mustResetPassword: false } }),
-    prisma.passwordResetToken.update({ where: { id: record.id }, data: { usedAt: new Date() } }),
-    prisma.session.updateMany({ where: { userId: record.userId }, data: { revokedAt: new Date() } }),
-  ]);
-  await audit({ action: "PASSWORD_RESET_COMPLETED", entity: "User", entityId: record.userId });
+  await prisma.$transaction(async (tx) => {
+    const record = await tx.passwordResetToken.findUnique({ where: { tokenHash: hashToken(token) } });
+    if (!record) throw new ConflictError("Invalid or expired reset link");
+    // Different reset links for the same user serialize on the user row too.
+    const users = await tx.$queryRaw<Array<{ isActive: boolean }>>`SELECT "isActive" FROM "User" WHERE id = ${record.userId} FOR UPDATE`;
+    if (!users[0]?.isActive) throw new ConflictError("Invalid or expired reset link");
+    const now = new Date();
+    const claimed = await tx.passwordResetToken.updateMany({ where: { id: record.id, usedAt: null, expiresAt: { gt: now } }, data: { usedAt: now } });
+    if (claimed.count !== 1) throw new ConflictError("Invalid or expired reset link");
+    await tx.user.update({ where: { id: record.userId }, data: { passwordHash, mustResetPassword: false } });
+    // A successful reset invalidates all earlier links and sessions.
+    await tx.passwordResetToken.updateMany({ where: { userId: record.userId, usedAt: null }, data: { usedAt: now } });
+    await tx.session.updateMany({ where: { userId: record.userId, revokedAt: null }, data: { revokedAt: now } });
+    await tx.auditLog.create({ data: { action: "PASSWORD_RESET_COMPLETED", entity: "User", entityId: record.userId } });
+  });
 }
 
-export async function changePassword(userId: string, currentPassword: string, newPassword: string) {
+export async function changePassword(userId: string, currentPassword: string, newPassword: string, sessionId: string) {
   const user = await prisma.user.findUniqueOrThrow({ where: { id: userId } });
-  if (!(await bcrypt.compare(currentPassword, user.passwordHash))) throw new Error("Current password is incorrect");
-  await prisma.user.update({
-    where: { id: userId },
-    data: { passwordHash: await bcrypt.hash(newPassword, 12), mustResetPassword: false },
+  if (!(await bcrypt.compare(currentPassword, user.passwordHash))) throw new UnauthorizedError("Current password is incorrect");
+  const passwordHash = await bcrypt.hash(newPassword, 12);
+  await prisma.$transaction(async (tx) => {
+    const changed = await tx.user.updateMany({ where: { id: userId, isActive: true, passwordHash: user.passwordHash },
+      data: { passwordHash, mustResetPassword: false } });
+    if (changed.count !== 1) throw new ConflictError("The account changed; sign in and try again");
+    const current = await tx.session.findFirst({ where: { id: sessionId, userId, revokedAt: null, expiresAt: { gt: new Date() } } });
+    if (!current) throw new UnauthorizedError("The session has expired; sign in again");
+    const now = new Date();
+    await tx.session.updateMany({ where: { userId, id: { not: sessionId }, revokedAt: null }, data: { revokedAt: now } });
+    await tx.passwordResetToken.updateMany({ where: { userId, usedAt: null }, data: { usedAt: now } });
+    await tx.auditLog.create({ data: { actorId: userId, action: "PASSWORD_CHANGED", entity: "User", entityId: userId } });
   });
-  await audit({ actorId: userId, action: "PASSWORD_CHANGED", entity: "User", entityId: userId });
 }

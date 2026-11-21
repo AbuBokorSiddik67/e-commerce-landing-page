@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased — MVP review and safety hardening
+
+- Added an additive Phase 1 inventory/order migration, tested on synthetic PostgreSQL data only, and a one-time empty-installation seed with explicit owner credentials and optional demo stock ledger.
+- Hardened staff role validation, temporary-password changes, session/reset revocation and login/reset races; development reset-link disclosure now requires an explicit opt-in. Added callback/body, provider-credential, notification-log, CSV and upload protections.
+- Corrected local persistent uploads, development database encoding, deployment templates and backup-script failure handling; added a read-only local empty-database preflight and Bengali setup guide.
+- Updated disposable inventory tests for receipt-based returns and cancellation-with-retained-stock. Three mixed-version old/new writer safety assertions still fail; deployment, native Prisma CLI, real backup/restore and providers remain unverified. See [DEPLOYMENT.md](DEPLOYMENT.md) and [TESTING.md](TESTING.md).
+
 ## Unreleased — form validation fixes
 
 - Standardized variant attributes as arrays of name/value pairs and added a data/default migration for legacy object-shaped attributes.

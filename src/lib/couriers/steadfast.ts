@@ -20,7 +20,7 @@ export const steadfastProvider: CourierProvider = {
   async testConnection(credentials, sandbox) {
     if (!this.credentialsValid(credentials)) return { ok: false, message: "API key and secret are required" };
     const result = await request<{ status?: number; balance?: number; message?: string }>(`${apiBase(sandbox)}/balance`, { headers: authHeaders(credentials) });
-    return result.status === 200 ? { ok: true, message: "API credentials accepted" } : { ok: false, message: result.message ?? "Credentials rejected" };
+    return result.status === 200 ? { ok: true, message: "API credentials accepted" } : { ok: false, message: "Credentials rejected" };
   },
 
   async createShipment(input) {
@@ -41,7 +41,7 @@ export const steadfastProvider: CourierProvider = {
         }),
       },
     );
-    if (!result.consignment_id && !result.tracking_code) throw new Error(result.message ?? "Steadfast order creation failed");
+    if (!result.consignment_id && !result.tracking_code) throw new Error("Steadfast order creation failed");
     const reference = String(result.consignment_id ?? result.tracking_code);
     return {
       consignmentId: reference,

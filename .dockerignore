@@ -9,4 +9,10 @@ playwright-report
 test-results
 .postgres-data
 public/uploads
+storage
+backups
+certs
+tmp
+Unselected files
 *.log
+*.tsbuildinfo

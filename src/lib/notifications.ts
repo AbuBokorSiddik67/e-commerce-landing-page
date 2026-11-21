@@ -32,10 +32,12 @@ async function sendEmail(to: string, subject: string, text: string) {
     auth: e.SMTP_USER ? { user: e.SMTP_USER, pass: e.SMTP_PASSWORD ?? "" } : undefined,
   });
   try {
-    const info = await transport.sendMail({ from: e.SMTP_FROM, to, subject, text });
-    return { status: "SENT" as NotificationStatus, response: info.messageId, error: null };
-  } catch (error) {
-    return { status: "FAILED" as NotificationStatus, response: null, error: error instanceof Error ? error.message : "Email failed" };
+    await transport.sendMail({ from: e.SMTP_FROM, to, subject, text });
+    // This is transport acceptance, not proof of final inbox delivery. Do not
+    // persist arbitrary SMTP responses which may echo addresses or secrets.
+    return { status: "SENT" as NotificationStatus, response: "SMTP server accepted message", error: null };
+  } catch {
+    return { status: "FAILED" as NotificationStatus, response: null, error: "Email delivery failed" };
   }
 }
 
@@ -49,12 +51,14 @@ async function sendSms(to: string, text: string) {
       body: JSON.stringify({ to, text }),
       signal: AbortSignal.timeout(15_000),
     });
-    const body = await response.text();
+    // Gateways may echo the bearer token, phone or message body. Status codes
+    // provide useful diagnostics without storing their untrusted response.
+    await response.body?.cancel().catch(() => undefined);
     return response.ok
-      ? { status: "ACCEPTED" as NotificationStatus, response: body.slice(0, 300), error: null }
-      : { status: "FAILED" as NotificationStatus, response: null, error: `HTTP ${response.status}: ${body.slice(0, 200)}` };
-  } catch (error) {
-    return { status: "FAILED" as NotificationStatus, response: null, error: error instanceof Error ? error.message : "SMS failed" };
+      ? { status: "ACCEPTED" as NotificationStatus, response: `Gateway accepted request (HTTP ${response.status})`, error: null }
+      : { status: "FAILED" as NotificationStatus, response: null, error: `SMS gateway HTTP ${response.status}` };
+  } catch {
+    return { status: "FAILED" as NotificationStatus, response: null, error: "SMS delivery failed" };
   }
 }
 

@@ -9,9 +9,12 @@ test("product variants and builder checkboxes survive real form submissions", as
   const slug = `form-validation-${randomUUID()}`;
   const name = `Form shirt ${slug}`;
   try {
+    const email = process.env.E2E_OWNER_EMAIL;
+    const password = process.env.E2E_OWNER_PASSWORD;
+    if (!email || !password) throw new Error("Set dedicated E2E_OWNER_EMAIL and E2E_OWNER_PASSWORD for the disposable database");
     await page.goto("/login");
-    await page.locator('input[name="email"]').fill(process.env.E2E_OWNER_EMAIL ?? "owner@landiq.local");
-    await page.locator('input[name="password"]').fill(process.env.E2E_OWNER_PASSWORD ?? "Owner@123456789");
+    await page.locator('input[name="email"]').fill(email);
+    await page.locator('input[name="password"]').fill(password);
     await page.getByRole("button", { name: "Sign in" }).click();
     await expect(page).toHaveURL(/\/dashboard/);
 

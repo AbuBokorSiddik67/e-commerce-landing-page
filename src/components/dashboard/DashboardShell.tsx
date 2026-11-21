@@ -52,6 +52,7 @@ export function DashboardShell({ children, user }: { children: ReactNode; user: 
         </div>)}
       </nav>
       <div className="border-t border-white/10 p-4">
+        <Link href="/change-password" className="flex items-center gap-2 rounded-lg px-3 py-2 text-sm text-ink-300 hover:bg-white/5 hover:text-white"><ShieldCheck size={16} />Change password</Link>
         <form action={logoutAction}><button className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-sm text-ink-300 hover:bg-white/5 hover:text-white"><LogOut size={16} />Sign out</button></form>
       </div>
     </div>

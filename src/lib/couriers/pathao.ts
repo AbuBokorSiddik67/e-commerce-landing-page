@@ -20,7 +20,7 @@ async function accessToken(c: Credentials, base: string) {
       }),
     },
   );
-  if (!result.access_token) throw new Error(result.message ?? "Pathao token request failed");
+  if (!result.access_token) throw new Error("Pathao token request failed");
   return result.access_token;
 }
 
@@ -76,7 +76,7 @@ export const pathaoProvider: CourierProvider = {
       },
     );
     const id = result.data?.consignment_id ?? result.data?.merchant_order_id;
-    if (!id) throw new Error(result.message ?? "Pathao order creation failed");
+    if (!id) throw new Error("Pathao order creation failed");
     return {
       consignmentId: String(id),
       trackingId: String(result.data?.tracking_code ?? id),
