@@ -14,7 +14,7 @@
 
 ## Illustrative additive PostgreSQL DDL
 
-The exact generated Prisma migration and constraint names must be reviewed against the actual schema and migration history before approval. This draft has **not** been executed or validated against PostgreSQL.
+The exact generated Prisma migration and constraint names must be reviewed against the actual schema and migration history before approval. This draft has **not** been executed or validated as a migration against PostgreSQL. A separate CREATE-only, schema-derived fixture was exercised on a new disposable cluster; its six local CHECK expressions statically match this draft, but those fixture results do not establish that the ALTER statements or existing data are compatible.
 
 ```sql
 CREATE TYPE "StockBucket" AS ENUM ('SELLABLE', 'DAMAGED');

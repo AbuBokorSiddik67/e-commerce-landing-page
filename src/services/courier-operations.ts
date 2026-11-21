@@ -34,7 +34,10 @@ export async function reconcileCourierBooking(raw: z.input<typeof bookingResolut
       throw new ConflictError("Booking claim, original merchant reference or environment cannot be matched");
     }
     const payload = shipment.payload as Prisma.JsonObject;
-    if (payload.conflictingProviderResult) throw new ConflictError("Multiple provider results require individual reconciliation; do not select one automatically");
+    if (payload.conflictingProviderResult !== undefined || payload.additionalProviderResults !== undefined) {
+      throw new ConflictError("Multiple provider results require individual reconciliation; do not select one automatically");
+    }
+    if (payload.landiqStaffRejection !== undefined) throw new ConflictError("Staff-reported rejection conflicts with a booking report, or its evidence is malformed; investigate both before resolving");
     if ((shipment.consignmentId && shipment.consignmentId !== input.consignmentId)
       || (shipment.trackingId && shipment.trackingId !== input.trackingId)) {
       throw new ConflictError("The reported references conflict with saved provider evidence");
@@ -59,6 +62,55 @@ export async function reconcileCourierBooking(raw: z.input<typeof bookingResolut
       raw: { merchantReference: input.merchantReference, evidence: input.evidence, sandbox: input.sandbox } } });
     await tx.auditLog.create({ data: { actorId, action: "COURIER_BOOKING_STAFF_RECORDED", entity: "CourierShipment", entityId: shipment.id,
       after: { orderId: shipment.orderId, consignmentId: input.consignmentId, trackingId: input.trackingId, evidence: input.evidence } } });
+    return updated;
+  });
+}
+
+const bookingRejectionSchema = z.object({
+  shipmentId: z.string().min(1), merchantReference: reference, sandbox: z.boolean(), evidence,
+  confirmOriginalAccount: z.literal(true), confirmDefinitiveRejection: z.literal(true),
+});
+
+/**
+ * Record a human report of a request-specific definitive rejection without
+ * pretending we can verify the provider contract. Neither this report nor an
+ * empty lookup clears the claim, permits another booking, or credits inventory.
+ */
+export async function recordCourierRejectionEvidence(raw: z.input<typeof bookingRejectionSchema>, actorId: string) {
+  const input = bookingRejectionSchema.parse(raw);
+  const pointer = await prisma.courierShipment.findUnique({ where: { id: input.shipmentId }, select: { orderId: true } });
+  if (!pointer) throw new NotFoundError("Courier shipment not found");
+  return prisma.$transaction(async (tx) => {
+    await lockOrder(tx, pointer.orderId);
+    const shipment = await tx.courierShipment.findUnique({ where: { id: input.shipmentId }, include: { order: true } });
+    if (!shipment || shipment.orderId !== pointer.orderId) throw new NotFoundError("Courier shipment not found");
+    const marker = courierClaimMarkerSchema.safeParse(shipment.payload);
+    if (!marker.success || shipment.providerCode === "manual" || shipment.status !== "PENDING"
+      || !["AWAITING_RESULT", "OUTCOME_UNKNOWN", "RECONCILIATION_REQUIRED"].includes(marker.data.landiqBooking.state)
+      || marker.data.landiqBooking.merchantReference !== shipment.order.orderNumber
+      || input.merchantReference !== shipment.order.orderNumber || marker.data.landiqBooking.sandbox !== input.sandbox) {
+      throw new ConflictError("Unresolved booking, original merchant reference or environment cannot be matched");
+    }
+    const payload = shipment.payload as Prisma.JsonObject;
+    if (shipment.consignmentId || shipment.trackingId || payload.conflictingProviderResult !== undefined || payload.additionalProviderResults !== undefined
+      || await tx.courierShipment.findFirst({ where: { orderId: shipment.orderId, id: { not: shipment.id } }, select: { id: true } })) {
+      throw new ConflictError("A booking reference or conflicting result already exists; investigate rather than recording rejection as fact");
+    }
+    const previous = z.object({ kind: z.literal("STAFF_REPORTED_REJECTION"), evidence: z.string() }).safeParse(payload.landiqStaffRejection);
+    if (payload.landiqStaffRejection !== undefined) {
+      if (previous.success && previous.data.evidence === input.evidence) return shipment;
+      throw new ConflictError("A rejection report already exists or is malformed; investigate the evidence before changing it");
+    }
+    const updated = await tx.courierShipment.update({ where: { id: shipment.id }, data: {
+      // Keep the claim state and PENDING status: the original call may still be in flight.
+      payload: { ...payload, landiqStaffRejection: { kind: "STAFF_REPORTED_REJECTION", evidence: input.evidence,
+        actorId, at: new Date().toISOString() } } as Prisma.InputJsonObject,
+    } });
+    await tx.courierTrackingEvent.create({ data: { shipmentId: shipment.id, status: "PENDING", source: "STAFF_RECONCILIATION",
+      description: "Staff reported a definitive rejection for this request; it is not independently verified and the claim remains blocked.",
+      raw: { merchantReference: input.merchantReference, evidence: input.evidence, sandbox: input.sandbox } } });
+    await tx.auditLog.create({ data: { actorId, action: "COURIER_REJECTION_STAFF_REPORTED", entity: "CourierShipment", entityId: shipment.id,
+      after: { orderId: shipment.orderId, evidence: input.evidence, sandbox: input.sandbox } } });
     return updated;
   });
 }

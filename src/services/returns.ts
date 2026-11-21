@@ -219,7 +219,21 @@ export async function updateReturnStatus(id: string, status: "APPROVED" | "REJEC
       order: { include: { items: true, refunds: true } }, receipts: true,
     } });
     if (!request || request.orderId !== pointer.orderId) throw new NotFoundError("Return request not found");
-    if (request.status === status) return request;
+    if (request.status === status) {
+      // A legacy status alone is not proof of physical receipt or stock
+      // posting. Even an exact retry must not report a successful restock or
+      // completed return when its receipt-linked ledger is missing or corrupt.
+      if (["INSPECTED", "RESTOCKED", "REFUNDED", "COMPLETED"].includes(status)) {
+        if (!request.receipts.length || request.receipts.some((receipt) => !receipt.inspectedAt)) {
+          throw new ConflictError("Historical return is ambiguous: inspected receipt evidence is missing; staff review is required");
+        }
+        await checkedReceiptLedger(tx, request.orderId, request.order.productId, request.order.items);
+        if (status === "REFUNDED" && !request.order.refunds.some((refund) => refund.amount > 0 && ["RECORDED", "REFUNDED"].includes(refund.status))) {
+          throw new ConflictError("Refund evidence requires review before confirming this return status");
+        }
+      }
+      return request;
+    }
     if (!RETURN_TRANSITIONS[request.status].includes(status)) {
       throw new ConflictError(`Cannot change return from ${request.status} to ${status}`);
     }
