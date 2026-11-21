@@ -8,6 +8,7 @@ type BkashResponse = {
   trxID?: string;
   transactionStatus?: string;
   amount?: string;
+  currency?: string;
   message?: string;
   error_message?: string;
 };
@@ -77,9 +78,11 @@ export const bkashProvider: PaymentProvider = {
       { paymentID, trxID },
       { Authorization: idToken, "X-App-Key": credentials.appKey },
     );
-    const paid = result.transactionStatus === "Completed";
-    // Reference stays the paymentID created at checkout so callbacks are idempotent.
-    return { status: paid ? "PAID" : "FAILED", reference: paymentID, amount: result.amount ? Number(result.amount) : undefined, raw: result };
+    const status = result.transactionStatus === "Completed" ? "PAID"
+      : result.transactionStatus === "Failed" ? "FAILED" : "PENDING";
+    // Never treat the request's paymentID as a verified provider response.
+    return { status, reference: result.paymentID ?? "",
+      amount: result.amount !== undefined ? Number(result.amount) : undefined, currency: result.currency, raw: result };
   },
 
   async refund({ reference, amount, credentials, sandbox, reason }) {

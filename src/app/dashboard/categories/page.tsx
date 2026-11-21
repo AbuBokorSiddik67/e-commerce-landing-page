@@ -1,9 +1,12 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 import { Alert, Badge, Card, EmptyState, PageHeader } from "@/components/ui";
 import { ConfirmButton } from "@/components/ui/ConfirmButton";
 import { deleteCategoryAction, saveCategoryAction } from "@/app/actions/products";
 
 export default async function CategoriesPage({ searchParams }: { searchParams: Promise<{ error?: string; success?: string }> }) {
+  await requirePageAccess(PERMISSIONS.PRODUCT_VIEW);
   const params = await searchParams;
   const [categories, products] = await Promise.all([
     prisma.category.findMany({ include: { parent: true, _count: { select: { products: true } } }, orderBy: [{ sortOrder: "asc" }, { name: "asc" }] }),

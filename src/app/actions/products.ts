@@ -34,6 +34,7 @@ function productInput(formData: FormData) {
     categoryId: optionalCategory(formData, "categoryId"),
     expectedCategoryId: optionalCategory(formData, "expectedCategoryId"),
     status: str(formData, "status", "DRAFT"),
+    expectedStatus: formData.has("expectedStatus") ? str(formData, "expectedStatus") : undefined,
     isFeatured: bool(formData, "isFeatured"),
     videoUrl: optionalStr(formData, "videoUrl"),
     weightGrams: optionalStr(formData, "weightGrams"),
@@ -129,7 +130,7 @@ export async function setStockAction(formData: FormData) {
   const user = await requirePermission(PERMISSIONS.INVENTORY_WRITE);
   await finish("/dashboard/inventory", () => setStock(
     str(formData, "variantId"), requiredStock(formData, "stock"), requiredStock(formData, "expectedStock"),
-    str(formData, "reason", "Manual adjustment"), user.id,
+    requiredStock(formData, "expectedMovementCount"), str(formData, "reason", "Manual adjustment"), user.id,
   ), "Stock adjusted");
 }
 

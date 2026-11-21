@@ -38,10 +38,11 @@ describe("product management", () => {
     const product = await createProduct(productInput, owner.id);
     expect(product.slug).toBe("test-shirt");
     expect(product.variants[0].stock).toBe(12);
-    const updated = await updateProduct(product.id, { ...productInput, name: "Test Shirt v2", variants: [{
+    const updated = await updateProduct(product.id, { ...productInput, name: "Test Shirt v2", expectedStatus: product.status, variants: [{
       ...productInput.variants[0], id: product.variants[0].id, stock: 8,
-      expectedStock: product.variants[0].stock, expectedUpdatedAt: product.variants[0].updatedAt.toISOString(),
-      expectedAttributes: product.variants[0].attributes,
+      expectedStock: product.variants[0].stock,
+      expectedMovementCount: await prisma.stockMovement.count({ where: { variantId: product.variants[0].id } }),
+      expectedUpdatedAt: product.variants[0].updatedAt.toISOString(), expectedAttributes: product.variants[0].attributes,
     }] }, owner.id);
     expect(updated.name).toBe("Test Shirt v2");
     expect((await prisma.productVariant.findUniqueOrThrow({ where: { id: product.variants[0].id } })).stock).toBe(8);

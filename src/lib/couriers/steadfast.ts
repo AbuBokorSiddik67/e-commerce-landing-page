@@ -1,8 +1,8 @@
 import { request, type CourierProvider } from "./types";
 
 type Credentials = Record<string, string>;
-const apiBase = (sandbox: boolean) =>
-  process.env.STEADFAST_API_BASE || (sandbox ? "https://sandbox-api.steadfast.com.bd/v1" : "https://api.steadfast.com.bd/v1");
+const apiBase = (sandbox: boolean, override?: string | null) =>
+  (override === undefined ? process.env.STEADFAST_API_BASE : override) || (sandbox ? "https://sandbox-api.steadfast.com.bd/v1" : "https://api.steadfast.com.bd/v1");
 
 const authHeaders = (c: Credentials) => ({
   "Api-Key": c.apiKey,
@@ -25,7 +25,7 @@ export const steadfastProvider: CourierProvider = {
 
   async createShipment(input) {
     const result = await request<{ status?: number; consignment_id?: string; tracking_code?: string; message?: string }>(
-      `${apiBase(input.sandbox)}/orders/create`,
+      `${apiBase(input.sandbox, input.apiBaseOverride)}/orders/create`,
       {
         method: "POST",
         headers: authHeaders(input.credentials),

@@ -2,6 +2,7 @@
 import "@testing-library/jest-dom/vitest";
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { PrismaClient, type Prisma } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
 import EmbeddedPostgres from "embedded-postgres";
 import { randomBytes, randomUUID } from "node:crypto";
 import { mkdir, mkdtemp, readFile, realpath, rm } from "node:fs/promises";
@@ -25,7 +26,8 @@ vi.mock("@/lib/prisma", () => ({
   }),
 }));
 vi.mock("@/lib/audit", () => ({ audit: vi.fn() }));
-vi.mock("@/lib/auth", () => ({ requirePermission: vi.fn().mockResolvedValue({ id: "fixture-actor" }) }));
+vi.mock("@/lib/auth", () => ({ requirePermission: vi.fn().mockResolvedValue({ id: "fixture-actor" }),
+  requirePageAccess: vi.fn().mockResolvedValue({ id: "fixture-viewer" }) }));
 vi.mock("next/cache", () => ({ revalidatePath: vi.fn() }));
 vi.mock("next/navigation", () => ({
   redirect: (location: string) => { throw new Error(`TEST_REDIRECT:${location}`); },
@@ -35,9 +37,9 @@ vi.mock("next/navigation", () => ({
 import { deleteCategoryAction, saveProductAction } from "@/app/actions/products";
 import EditProduct from "@/app/dashboard/products/[id]/page";
 import { adjustStock, setStock } from "@/services/inventory";
-import { createProduct, updateProduct, type ProductInput } from "@/services/products";
+import { createProduct, setProductStatus, updateProduct, type ProductInput } from "@/services/products";
 
-type ProductDetails = Prisma.ProductGetPayload<{ include: { variants: true; images: true } }>;
+type ProductDetails = Prisma.ProductGetPayload<{ include: { variants: { include: { _count: { select: { movements: true } } } }; images: true } }>;
 let postgres: EmbeddedPostgres | undefined;
 let started = false;
 let scratch: string | undefined;
@@ -98,7 +100,8 @@ async function createFixtureProduct(categoryId?: string, variantCount = 1) {
 
 async function loadProduct(id: string) {
   return db().product.findUniqueOrThrow({
-    where: { id }, include: { variants: { orderBy: { position: "asc" } }, images: { orderBy: { position: "asc" } } },
+    where: { id }, include: { variants: { orderBy: { position: "asc" }, include: { _count: { select: { movements: true } } } },
+      images: { orderBy: { position: "asc" } } },
   });
 }
 
@@ -108,12 +111,13 @@ function editInput(product: ProductDetails): ProductInput {
     shortDescription: product.shortDescription, description: product.description,
     regularPrice: product.regularPrice, salePrice: product.salePrice,
     categoryId: product.categoryId, expectedCategoryId: product.categoryId,
-    status: product.status, isFeatured: product.isFeatured, videoUrl: product.videoUrl, weightGrams: product.weightGrams,
+    status: product.status, expectedStatus: product.status, isFeatured: product.isFeatured, videoUrl: product.videoUrl, weightGrams: product.weightGrams,
     images: product.images.map((image) => ({ url: image.url, alt: image.alt ?? undefined, kind: image.kind === "VIDEO" ? "VIDEO" : "IMAGE" })),
     variants: product.variants.map((variant) => ({
       id: variant.id, name: variant.name, sku: variant.sku, price: variant.price, stock: variant.stock,
       lowStockThreshold: variant.lowStockThreshold, imageUrl: variant.imageUrl, isActive: variant.isActive, position: variant.position,
-      expectedStock: variant.stock, expectedUpdatedAt: variant.updatedAt.toISOString(), expectedAttributes: variant.attributes,
+      expectedStock: variant.stock, expectedMovementCount: variant._count.movements,
+      expectedUpdatedAt: variant.updatedAt.toISOString(), expectedAttributes: variant.attributes,
     })),
   };
 }
@@ -147,16 +151,33 @@ describe.skipIf(!enabled)("product preservation on a fresh disposable PostgreSQL
     await postgres.initialise();
     await postgres.start();
     started = true;
-    const url = `postgresql://${user}:${password}@127.0.0.1:${port}/postgres?schema=public`;
-    state.client = new PrismaClient({ datasources: { db: { url } } });
-    const [identity] = await db().$queryRaw<Array<{ directory: string; database: string; username: string; port: string }>>`
-      SELECT current_setting('data_directory') AS "directory", current_database() AS "database",
-             current_user AS "username", current_setting('port') AS "port"
-    `;
-    if (!identity || await realpath(identity.directory) !== await realpath(directory)
-      || identity.database !== "postgres" || identity.username !== user || Number(identity.port) !== port) {
-      throw new Error("Refusing to write to an unverified database");
+    const database = `product_${randomBytes(8).toString("hex")}`;
+    const makeClient = (name: string) => new PrismaClient({ adapter: new PrismaPg({
+      host: "127.0.0.1", port, user, password, database: name, ssl: false,
+    }) });
+    const identify = async (client: PrismaClient) => {
+      const [value] = await client.$queryRaw<Array<{ directory: string; database: string; username: string; port: number; host: string; schema: string }>>`
+        SELECT current_setting('data_directory') AS "directory", current_database()::text AS "database",
+          current_user::text AS "username", inet_server_port() AS "port", host(inet_server_addr()) AS "host", current_schema()::text AS "schema"
+      `;
+      return value;
+    };
+    const matches = async (value: Awaited<ReturnType<typeof identify>>, expectedDatabase: string) =>
+      Boolean(value && await realpath(value.directory) === await realpath(directory) && value.database === expectedDatabase
+        && value.username === user && value.port === port && value.host === "127.0.0.1" && value.schema === "public");
+    const admin = makeClient("postgres");
+    try {
+      if (!(await matches(await identify(admin), "postgres")) || !/^product_[a-f0-9]{16}$/.test(database)) {
+        throw new Error("Refusing to create a test database on an unverified cluster");
+      }
+      await admin.$executeRawUnsafe(`CREATE DATABASE "${database}"`);
+    } finally {
+      await admin.$disconnect();
     }
+    state.client = makeClient(database);
+    const identity = await identify(db());
+    if (!(await matches(identity, database))) throw new Error("Refusing to write to an unverified database");
+    console.info("Verified disposable product PostgreSQL identity", { host: "127.0.0.1", port, database, schema: "public", user, directory });
     const fixture = await readFile(path.join(process.cwd(), "tests/fixtures/product-disposable-schema.sql"), "utf8");
     for (const statement of fixture.replace(/^--.*$/gm, "").split(";").map((part) => part.trim()).filter(Boolean)) {
       await db().$executeRawUnsafe(statement);
@@ -189,7 +210,7 @@ describe.skipIf(!enabled)("product preservation on a fresh disposable PostgreSQL
     const reservation = await db().stockReservation.create({ data: {
       orderId, variantId: created.variants[0].id, quantity: 1, expiresAt: new Date("2030-01-01T00:00:00.000Z"),
     } });
-    const movement = await db().stockMovement.create({ data: {
+    const movement = await db().stockMovement.findFirstOrThrow({ where: {
       productId: created.id, variantId: created.variants[0].id, type: "PURCHASE", quantity: 7, balanceAfter: 7,
     } });
 
@@ -334,24 +355,106 @@ describe.skipIf(!enabled)("product preservation on a fresh disposable PostgreSQL
     expect(saved.name).toBe(original.name);
     expect(saved.images).toEqual(original.images);
     expect(saved.variants[0].stock).toBe(6);
-    expect(await db().stockMovement.findMany({ where: { productId: created.id } })).toEqual([
+    const movements = await db().stockMovement.findMany({ where: { productId: created.id } });
+    expect(movements).toHaveLength(2);
+    expect(movements).toEqual(expect.arrayContaining([
+      expect.objectContaining({ variantId: original.variants[0].id, type: "PURCHASE", quantity: 7, balanceAfter: 7 }),
       expect.objectContaining({ variantId: original.variants[0].id, type: "SALE", quantity: -1, balanceAfter: 6 }),
-    ]);
+    ]));
+  }, 20_000);
+
+  it("does not let a stale product editor republish a concurrently archived product", async () => {
+    const created = await createFixtureProduct();
+    await setProductStatus(created.id, "PUBLISHED");
+    const snapshot = await loadProduct(created.id);
+    const stale = editInput(snapshot);
+    stale.name = "Stale editor change";
+    await setProductStatus(created.id, "ARCHIVED");
+    await expect(updateProduct(created.id, stale)).rejects.toThrow(/status changed.*Reload/);
+    const current = await loadProduct(created.id);
+    expect(current.status).toBe("ARCHIVED");
+    expect(current.name).toBe(snapshot.name);
+  });
+
+  it("rechecks the editor status predicate after waiting for a concurrent archive", async () => {
+    const created = await createFixtureProduct();
+    await setProductStatus(created.id, "PUBLISHED");
+    const snapshot = await loadProduct(created.id);
+    const stale = editInput(snapshot);
+    const locked = deferred();
+    const release = deferred();
+    const archive = db().$transaction(async (tx) => {
+      await tx.product.update({ where: { id: created.id }, data: { status: "ARCHIVED" } });
+      locked.resolve();
+      await release.promise;
+    }, { timeout: 15_000 });
+    await locked.promise;
+    const save = updateProduct(created.id, stale).then(() => null, (error: unknown) => error);
+    try { await waitForBlockedQuery("Product"); } finally { release.resolve(); }
+    await archive;
+    expect(await save).toEqual(expect.objectContaining({ message: expect.stringMatching(/status changed.*Reload/) }));
+    expect((await loadProduct(created.id)).status).toBe("ARCHIVED");
   }, 20_000);
 
   it("rejects a stale manual stock adjustment and records a matching adjustment once", async () => {
     const created = await createFixtureProduct();
     const id = created.variants[0].id;
     await db().$transaction((tx) => adjustStock(tx, { variantId: id, delta: -2, type: "SALE" }));
-    await expect(setStock(id, 10, 7, "Stale count")).rejects.toThrow(/Stock changed/);
+    await expect(setStock(id, 10, 7, 1, "Stale count")).rejects.toThrow(/Stock changed/);
     expect((await db().productVariant.findUniqueOrThrow({ where: { id } })).stock).toBe(5);
-    await expect(setStock(id, 8, 5, "Fresh count")).resolves.toBe(8);
+    await expect(setStock(id, 8, 5, 2, "Fresh count")).resolves.toBe(8);
     const movements = await db().stockMovement.findMany({ where: { variantId: id } });
-    expect(movements).toHaveLength(2);
+    expect(movements).toHaveLength(3);
     expect(movements).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "PURCHASE", quantity: 7, balanceAfter: 7 }),
       expect.objectContaining({ type: "SALE", quantity: -2, balanceAfter: 5 }),
       expect.objectContaining({ type: "ADJUSTMENT", quantity: 3, balanceAfter: 8 }),
     ]));
+  });
+
+  it("rejects an inventory form after intervening stock movements return the balance to its original value", async () => {
+    const created = await createFixtureProduct();
+    const id = created.variants[0].id;
+    await db().$transaction((tx) => adjustStock(tx, { variantId: id, delta: -1, type: "SALE" }));
+    await db().$transaction((tx) => adjustStock(tx, { variantId: id, delta: 1, type: "CANCELLATION" }));
+    expect((await db().productVariant.findUniqueOrThrow({ where: { id } })).stock).toBe(7);
+    // This form was opened before both movements; the balance alone is an ABA.
+    await expect(setStock(id, 10, 7, 1, "Stale count")).rejects.toThrow(/Stock changed/);
+    expect((await db().productVariant.findUniqueOrThrow({ where: { id } })).stock).toBe(7);
+  });
+
+  it("rechecks the movement snapshot after waiting for a net-zero stock transaction", async () => {
+    const created = await createFixtureProduct();
+    const id = created.variants[0].id;
+    const locked = deferred();
+    const release = deferred();
+    const writer = db().$transaction(async (tx) => {
+      await adjustStock(tx, { variantId: id, delta: -1, type: "SALE" });
+      await adjustStock(tx, { variantId: id, delta: 1, type: "CANCELLATION" });
+      locked.resolve();
+      await release.promise;
+    }, { timeout: 15_000 });
+    await locked.promise;
+    const adjustment = setStock(id, 10, 7, 1, "Stale count").then(() => null, (error: unknown) => error);
+    try { await waitForBlockedQuery("ProductVariant"); } finally { release.resolve(); }
+    await writer;
+    expect(await adjustment).toEqual(expect.objectContaining({ message: expect.stringMatching(/Stock changed/) }));
+    expect((await db().productVariant.findUniqueOrThrow({ where: { id } })).stock).toBe(7);
+    expect(await db().stockMovement.count({ where: { variantId: id } })).toBe(3);
+  }, 20_000);
+
+  it("rejects a stale product stock edit after an ABA even when the variant timestamp collides", async () => {
+    const created = await createFixtureProduct();
+    const original = await loadProduct(created.id);
+    const stale = editInput(original);
+    stale.variants[0].stock = 10;
+    const id = original.variants[0].id;
+    await db().$transaction((tx) => adjustStock(tx, { variantId: id, delta: -1, type: "SALE" }));
+    await db().$transaction((tx) => adjustStock(tx, { variantId: id, delta: 1, type: "CANCELLATION" }));
+    // Model two writes sharing the millisecond-precision timestamp used by @updatedAt.
+    await db().productVariant.update({ where: { id }, data: { updatedAt: original.variants[0].updatedAt } });
+    await expect(updateProduct(created.id, stale)).rejects.toThrow(/changed.*Reload/);
+    expect((await loadProduct(created.id)).variants[0].stock).toBe(7);
   });
 
   it("serializes category deletion with a concurrent assignment before checking for products", async () => {

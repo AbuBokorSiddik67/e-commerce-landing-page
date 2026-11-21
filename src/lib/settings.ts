@@ -327,9 +327,15 @@ export async function getPaymentCredential(code: string): Promise<PaymentCredent
   return withEnvFallback(decodeCredentials(row?.credentials), code.toUpperCase(), provider.requiredCredentials) as PaymentCredentials;
 }
 
-export async function getCourierCredential(code: string): Promise<CourierCredentials> {
+// Decode the exact configuration snapshot the caller has read. Booking uses
+// this instead of a second, independently racing configuration lookup.
+export async function getCourierCredentialFromSnapshot(code: string, rawCredentials: unknown): Promise<CourierCredentials> {
   const provider = getCourierProvider(code);
   if (!provider) throw new ConflictError("Unknown courier");
+  return withEnvFallback(decodeCredentials(rawCredentials), code.toUpperCase(), provider.requiredCredentials) as CourierCredentials;
+}
+
+export async function getCourierCredential(code: string): Promise<CourierCredentials> {
   const row = await prisma.courierProviderConfiguration.findUnique({ where: { code } });
-  return withEnvFallback(decodeCredentials(row?.credentials), code.toUpperCase(), provider.requiredCredentials) as CourierCredentials;
+  return getCourierCredentialFromSnapshot(code, row?.credentials);
 }

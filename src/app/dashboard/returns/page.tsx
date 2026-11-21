@@ -1,9 +1,12 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import Link from "next/link";
 import { prisma } from "@/lib/prisma";
 import { formatDate, formatMoney } from "@/lib/utils";
 import { Badge, Card, EmptyState, PageHeader } from "@/components/ui";
 
 export default async function ReturnsPage() {
+  await requirePageAccess(PERMISSIONS.ORDER_VIEW);
   const [returns, refunds] = await Promise.all([
     prisma.returnRequest.findMany({ include: { order: true, product: { select: { name: true } } }, orderBy: { createdAt: "desc" }, take: 100 }),
     prisma.refund.findMany({ include: { order: { select: { orderNumber: true } } }, orderBy: { createdAt: "desc" }, take: 50 }),

@@ -1,3 +1,5 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 import { getCourierConfigurations, getSetting } from "@/lib/settings";
 import { Alert, Badge, Card, PageHeader, ToggleRow } from "@/components/ui";
@@ -7,6 +9,8 @@ import { formatDate } from "@/lib/utils";
 export const dynamic = "force-dynamic";
 
 export default async function CouriersPage({ searchParams }: { searchParams: Promise<{ error?: string; success?: string }> }) {
+  await requirePageAccess(PERMISSIONS.COURIER_SETTINGS);
+  await requirePageAccess(PERMISSIONS.ORDER_VIEW);
   const params = await searchParams;
   const [configs, delivery, rules, shipments] = await Promise.all([
     getCourierConfigurations(),

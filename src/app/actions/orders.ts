@@ -4,7 +4,7 @@ import { requirePermission } from "@/lib/auth";
 import { PERMISSIONS } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 import {
-  assignManualCourier, bookCourierShipment, cancelOrder, collectCod,
+  assignManualCourier, bookCourierShipment, cancelOrder, collectCod, expireEligibleReservations,
   settleCod, syncCourierTracking, updateOrderStatus,
 } from "@/services/orders";
 import { finish, num, str } from "./helpers";
@@ -21,6 +21,14 @@ export async function cancelOrderAction(formData: FormData) {
   const user = await requirePermission(PERMISSIONS.ORDER_WRITE);
   const id = str(formData, "id");
   await finish(path(id), () => cancelOrder(id, user.id, str(formData, "reason", "Cancelled by staff")), "Order cancelled and stock restored where applicable");
+}
+
+export async function expireReservationsAction() {
+  const user = await requirePermission(PERMISSIONS.ORDER_WRITE);
+  await finish("/dashboard/orders", async () => {
+    const result = await expireEligibleReservations(user.id);
+    if (result.deferred) console.warn("Some eligible reservation candidates need review", { deferred: result.deferred });
+  }, "Eligible unpaid reservations processed; uncertain payments remain reserved");
 }
 
 export async function internalNoteAction(formData: FormData) {

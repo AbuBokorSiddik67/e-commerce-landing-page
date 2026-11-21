@@ -1,3 +1,5 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import Link from "next/link";
 import { Copy, Eye, EyeOff, Pencil, Trash2 } from "lucide-react";
 import { prisma } from "@/lib/prisma";
@@ -8,6 +10,8 @@ import { deleteProductAction, duplicateProductAction, productStatusAction } from
 import { ConfirmButton } from "@/components/ui/ConfirmButton";
 
 export default async function ProductsPage({ searchParams }: { searchParams: Promise<{ page?: string; search?: string; status?: string; error?: string; success?: string }> }) {
+  await requirePageAccess(PERMISSIONS.PRODUCT_VIEW);
+  await requirePageAccess(PERMISSIONS.INVENTORY_VIEW);
   const params = await searchParams;
   const result = await listProducts({ page: Number(params.page ?? 1), search: params.search, status: params.status });
   return (

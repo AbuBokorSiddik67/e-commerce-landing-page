@@ -1,3 +1,5 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 import { ROLE_LABELS, ROLE_PERMISSIONS, ALL_PERMISSIONS } from "@/lib/permissions";
 import { Alert, Badge, Card, PageHeader } from "@/components/ui";
@@ -7,6 +9,7 @@ import { formatDate } from "@/lib/utils";
 export const dynamic = "force-dynamic";
 
 export default async function StaffPage({ searchParams }: { searchParams: Promise<{ error?: string; success?: string }> }) {
+  await requirePageAccess(PERMISSIONS.STAFF_VIEW);
   const params = await searchParams;
   const [users, roles] = await Promise.all([
     prisma.user.findMany({ include: { roles: { include: { role: true } } }, orderBy: { createdAt: "desc" } }),

@@ -1,8 +1,11 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import { getDashboardMetrics, getDailySeries, resolveRange } from "@/services/analytics";
 import { formatMoney } from "@/lib/utils";
 import { Card, PageHeader, StatCard } from "@/components/ui";
 
 export default async function AnalyticsPage({ searchParams }: { searchParams: Promise<{ range?: string; from?: string; to?: string }> }) {
+  await requirePageAccess(PERMISSIONS.ANALYTICS_VIEW);
   const params = await searchParams;
   const range = resolveRange(params.range ?? "30d", params.from, params.to);
   const [metrics, series] = await Promise.all([getDashboardMetrics(range), getDailySeries(range)]);

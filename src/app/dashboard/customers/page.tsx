@@ -1,9 +1,12 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import Link from "next/link";
 import { listCustomers } from "@/services/customers";
 import { formatDate, formatMoney, maskPhone } from "@/lib/utils";
 import { Alert, Badge, EmptyState, PageHeader, Pagination } from "@/components/ui";
 
 export default async function CustomersPage({ searchParams }: { searchParams: Promise<{ page?: string; search?: string; error?: string; success?: string }> }) {
+  await requirePageAccess(PERMISSIONS.CUSTOMER_VIEW);
   const params = await searchParams;
   const result = await listCustomers({ page: Number(params.page ?? 1), search: params.search });
   return (

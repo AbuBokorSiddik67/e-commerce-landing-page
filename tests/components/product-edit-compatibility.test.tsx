@@ -8,6 +8,7 @@ vi.mock("@/lib/prisma", () => ({
   prisma: { product: { findUnique: db.findProduct }, category: { findMany: db.findCategories } },
 }));
 vi.mock("@/app/actions/products", () => ({ saveProductAction: vi.fn() }));
+vi.mock("@/lib/auth", () => ({ requirePageAccess: vi.fn().mockResolvedValue({ id: "fixture-viewer" }) }));
 vi.mock("next/navigation", () => ({ notFound: () => { throw new Error("NOT_FOUND"); } }));
 
 import EditProduct from "@/app/dashboard/products/[id]/page";
@@ -21,7 +22,7 @@ function productWith(attributes: unknown) {
     variants: [{
       id: "variant-1", productId: "product-1", name: "Medium", sku: "MEDIUM", price: null,
       stock: 7, lowStockThreshold: 2, imageUrl: null, attributes, isActive: true, position: 0,
-      updatedAt: new Date("2025-01-01T00:00:00.000Z"),
+      updatedAt: new Date("2025-01-01T00:00:00.000Z"), _count: { movements: 1 },
     }],
   };
 }

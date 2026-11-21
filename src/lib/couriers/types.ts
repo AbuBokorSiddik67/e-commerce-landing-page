@@ -12,6 +12,9 @@ export type ShipmentInput = {
   items: string;
   sandbox: boolean;
   credentials: Credentials;
+  // Server-side endpoint snapshot for a durable booking claim. null means use
+  // the provider default even if the process environment changes later.
+  apiBaseOverride?: string | null;
 };
 
 export type CourierBooking = {

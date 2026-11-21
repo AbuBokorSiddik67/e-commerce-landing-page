@@ -1,3 +1,5 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import { prisma } from "@/lib/prisma";
 import { listCoupons } from "@/services/coupons";
 import { formatDate } from "@/lib/utils";
@@ -5,6 +7,7 @@ import { Alert, Badge, Card, PageHeader } from "@/components/ui";
 import { saveCouponAction } from "@/app/actions/catalog";
 
 export default async function CouponsPage({ searchParams }: { searchParams: Promise<{ error?: string; success?: string }> }) {
+  await requirePageAccess(PERMISSIONS.COUPON_WRITE);
   const params = await searchParams;
   const coupons = await listCoupons();
   const products = await prisma.product.findMany({ select: { id: true, name: true }, orderBy: { name: "asc" } });

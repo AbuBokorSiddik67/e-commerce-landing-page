@@ -78,7 +78,8 @@ export const nagadProvider: PaymentProvider = {
     const status = String(result.status ?? result.paymentStatus ?? "PENDING").toUpperCase();
     return {
       status: status === "SUCCESS" || status === "COMPLETE" ? "PAID" : status === "FAILED" ? "FAILED" : "PENDING",
-      reference: paymentRefId,
+      // Do not substitute the caller's identifier if the response omits it.
+      reference: typeof result.paymentRefId === "string" ? result.paymentRefId : "",
       raw: result,
     };
   },

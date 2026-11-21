@@ -9,7 +9,7 @@ import type { VariantAttribute } from "@/lib/product-attributes";
 type AttributeRow = VariantAttribute & { uiKey: string };
 type Variant = {
   uiKey: string; id?: string; name: string; sku: string; price: string; stock: string;
-  expectedStock?: number; expectedUpdatedAt?: string; expectedAttributes?: unknown;
+  expectedStock?: number; expectedMovementCount?: number; expectedUpdatedAt?: string; expectedAttributes?: unknown;
   lowStockThreshold: number; imageUrl: string; attributes: AttributeRow[]; isActive: boolean;
 };
 type Image = { url: string; alt: string; kind: "IMAGE" | "VIDEO" };
@@ -72,14 +72,15 @@ export function ProductForm({ product, categories }: {
     status: string; isFeatured: boolean; videoUrl: string | null; weightGrams: number | null;
     attributes: string[]; specifications: unknown;
     images: Array<{ url: string; alt: string | null; kind: string }>;
-    variants: Array<{ id: string; name: string; sku: string | null; price: number | null; stock: number; lowStockThreshold: number; imageUrl: string | null; attributes: VariantAttribute[]; expectedAttributes: unknown; updatedAt: Date | string; isActive: boolean }>;
+    variants: Array<{ id: string; name: string; sku: string | null; price: number | null; stock: number; lowStockThreshold: number; imageUrl: string | null; attributes: VariantAttribute[]; expectedAttributes: unknown; expectedMovementCount: number; updatedAt: Date | string; isActive: boolean }>;
   };
   categories: Array<{ id: string; name: string; isActive?: boolean }>;
 }) {
   const nextUiKey = useRef(0);
   const [variants, setVariants] = useState<Variant[]>(() => product?.variants.map((v) => ({
     uiKey: `existing-${v.id}`, id: v.id, name: v.name, sku: v.sku ?? "", price: v.price == null ? "" : String(v.price), stock: String(v.stock),
-    expectedStock: v.stock, expectedUpdatedAt: new Date(v.updatedAt).toISOString(), expectedAttributes: v.expectedAttributes,
+    expectedStock: v.stock, expectedMovementCount: v.expectedMovementCount,
+    expectedUpdatedAt: new Date(v.updatedAt).toISOString(), expectedAttributes: v.expectedAttributes,
     lowStockThreshold: v.lowStockThreshold, imageUrl: v.imageUrl ?? "",
     attributes: v.attributes.map((attribute, index) => ({ ...attribute, uiKey: `initial-${index}` })), isActive: v.isActive,
   })) ?? [emptyVariant("initial-new")]);
@@ -124,9 +125,10 @@ export function ProductForm({ product, categories }: {
   return (
     <form action={saveProductAction} className="grid gap-6 lg:grid-cols-[1fr_340px]">
       <input type="hidden" name="id" value={product?.id ?? ""} />
-      {product && <input type="hidden" name="expectedCategoryId" value={product.categoryId ?? ""} />}
+      {product && <><input type="hidden" name="expectedCategoryId" value={product.categoryId ?? ""} /><input type="hidden" name="expectedStatus" value={product.status} /></>}
       <input type="hidden" name="variants" value={JSON.stringify(variants.map((v) => ({
-        ...(v.id ? { id: v.id, expectedStock: v.expectedStock, expectedUpdatedAt: v.expectedUpdatedAt, expectedAttributes: v.expectedAttributes } : {}),
+        ...(v.id ? { id: v.id, expectedStock: v.expectedStock, expectedMovementCount: v.expectedMovementCount,
+          expectedUpdatedAt: v.expectedUpdatedAt, expectedAttributes: v.expectedAttributes } : {}),
         name: v.name, sku: v.sku || null,
         price: v.price === "" ? null : Number(v.price), stock: v.stock === "" ? null : Number(v.stock),
         lowStockThreshold: Number(v.lowStockThreshold), imageUrl: v.imageUrl || null,

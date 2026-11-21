@@ -37,7 +37,7 @@ describe("payment provider adapters", () => {
   it("verifies bKash only through the server-side query API", async () => {
     vi.stubGlobal("fetch", vi.fn()
       .mockResolvedValueOnce(new Response(JSON.stringify({ id_token: "token-1" }), { status: 200 }))
-      .mockResolvedValueOnce(new Response(JSON.stringify({ transactionStatus: "Completed", amount: "500" }), { status: 200 })));
+      .mockResolvedValueOnce(new Response(JSON.stringify({ transactionStatus: "Completed", paymentID: "PID1", amount: "500", currency: "BDT" }), { status: 200 })));
     const result = await bkashProvider.verify({ paymentID: "PID1", trxID: "TRX1" }, {
       appKey: "k", appSecret: "s", username: "u", password: "p",
     }, true);

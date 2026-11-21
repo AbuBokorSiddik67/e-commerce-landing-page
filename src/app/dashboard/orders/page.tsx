@@ -1,9 +1,13 @@
+import { requirePageAccess } from "@/lib/auth";
+import { PERMISSIONS } from "@/lib/permissions";
 import Link from "next/link";
 import { listOrders } from "@/services/orders";
+import { expireReservationsAction } from "@/app/actions/orders";
 import { formatDate, formatMoney } from "@/lib/utils";
 import { Alert, Badge, EmptyState, PageHeader, Pagination } from "@/components/ui";
 
 export default async function OrdersPage({ searchParams }: { searchParams: Promise<{ page?: string; search?: string; status?: string; paymentMethod?: string; from?: string; to?: string; error?: string; success?: string }> }) {
+  await requirePageAccess(PERMISSIONS.ORDER_VIEW);
   const params = await searchParams;
   const result = await listOrders({ ...params, page: Number(params.page ?? 1) });
   const query = new URLSearchParams(Object.entries(params).filter(([k]) => ["search", "status", "paymentMethod", "from", "to"].includes(k)).map(([k, v]) => [k, String(v ?? "")]));
@@ -11,6 +15,10 @@ export default async function OrdersPage({ searchParams }: { searchParams: Promi
     <>
       <PageHeader title="Orders" description="Search, filter and fulfil orders. Delivery and financial settlement are tracked separately." action={<a href={`/api/orders/export?${query.toString()}`} className="btn-secondary">Export CSV</a>} />
       <Alert error={params.error} success={params.success} />
+      <form action={expireReservationsAction} className="mb-5 flex flex-wrap items-center gap-3">
+        <button className="btn-secondary">Process safely expired payment holds</button>
+        <span className="text-xs text-ink-500">Only payments proven unstarted or provider-verified closed qualify. Current providers do not yet verify session closure; uncertain payments remain reserved.</span>
+      </form>
       <form method="get" className="mb-5 grid gap-3 sm:grid-cols-2 lg:grid-cols-5">
         <input className="input" name="search" placeholder="Order / phone / customer" defaultValue={params.search} />
         <select className="input" name="status" defaultValue={params.status ?? ""}><option value="">All statuses</option>{["PENDING", "CONFIRMED", "PROCESSING", "READY_TO_SHIP", "SHIPPED", "OUT_FOR_DELIVERY", "DELIVERED", "CANCELLED", "RETURNED", "FAILED_DELIVERY"].map((s) => <option key={s} value={s}>{s.replaceAll("_", " ")}</option>)}</select>
